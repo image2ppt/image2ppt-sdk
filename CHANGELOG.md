@@ -3,6 +3,13 @@
 All notable changes to the image2ppt SDKs (Python + TypeScript) are documented
 here. The two clients share a single version number.
 
+## 0.5.3
+
+### Fixed
+
+- The deprecation-notice tests now assert the exact `Link` header the API sends,
+  which points at this repository's changelog. No client behavior changed.
+
 ## 0.5.2
 
 ### Fixed

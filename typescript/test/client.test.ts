@@ -1614,7 +1614,7 @@ const SDK_USER_AGENT_RE = /^image2ppt-(python|node)\/\S+$/;
 const DEPRECATION_HEADERS = {
   Deprecation: "@1793491200",
   Sunset: "Sun, 01 Nov 2026 00:00:00 GMT",
-  Link: '<https://pypi.org/project/image2ppt/#history>; rel="deprecation"',
+  Link: '<https://github.com/image2ppt/image2ppt-sdk/blob/main/CHANGELOG.md>; rel="deprecation"',
 };
 
 describe("client identification", () => {
@@ -1650,7 +1650,7 @@ describe("deprecation warning", () => {
       const msg = String(spy.mock.calls[0]?.[0]);
       expect(msg).toContain(VERSION);
       expect(msg).toMatch(/deprecated/i);
-      expect(msg).toContain("pypi.org/project/image2ppt/#history");
+      expect(msg).toContain("image2ppt-sdk/blob/main/CHANGELOG.md");
       expect(msg).toContain("Sun, 01 Nov 2026 00:00:00 GMT");
       expect(msg).toContain("warnOnDeprecated: false");
     } finally {
