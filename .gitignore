@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node / TypeScript
+node_modules/
+typescript/dist/
+*.tsbuildinfo
+npm-debug.log*
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets / env (never commit — holds PyPI/npm tokens)
+.env
+.env.*
+
+# Local artifacts
+*.pptx
+out.pptx
