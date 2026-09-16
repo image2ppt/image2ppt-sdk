@@ -29,3 +29,6 @@ npm-debug.log*
 # Local artifacts
 *.pptx
 out.pptx
+
+# Local agent/session state — never belongs in the repo or a release snapshot
+.claude/

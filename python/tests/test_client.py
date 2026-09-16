@@ -1433,7 +1433,7 @@ _DEPRECATION_HEADERS = {
     "Deprecation": "@1793491200",
     "Sunset": "Sun, 01 Nov 2026 00:00:00 GMT",
     "Link": (
-        "<https://github.com/image2ppt/image2ppt-sdk/blob/main/CHANGELOG.md>; "
+        "<https://pypi.org/project/image2ppt/#history>; "
         'rel="deprecation"'
     ),
 }
@@ -1473,7 +1473,7 @@ def test_deprecation_header_warns_once(caplog):
     msg = messages[0]
     assert image2ppt.__version__ in msg
     assert "deprecated" in msg.lower()
-    assert "CHANGELOG.md" in msg
+    assert "pypi.org/project/image2ppt/#history" in msg
     assert "Sun, 01 Nov 2026 00:00:00 GMT" in msg
     assert "warn_on_deprecated=False" in msg
 
