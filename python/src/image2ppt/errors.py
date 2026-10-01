@@ -30,6 +30,17 @@ class Image2PPTError(Exception):
         #: them (``wait``/``download``) or come back to them later. Empty for any
         #: error not raised out of a batch call.
         self.submitted_jobs: List[Any] = []
+        #: Which entry of ``urls`` caused the error, counting from 0 — set only for
+        #: errors the service ties to one link (``INVALID_URL``, ``URL_FETCH_FAILED``,
+        #: and ``INVALID_FILE`` / ``PAYLOAD_TOO_LARGE`` for a downloaded file).
+        #: ``None`` for everything else.
+        self.index: Optional[int] = None
+        #: The ``Idempotency-Key`` the failed submission was sent with — set on every
+        #: error raised out of ``submit`` / ``submit_urls`` / ``convert``, ``None``
+        #: elsewhere. **Submitting again with this same key is always safe** for 24
+        #: hours: if an earlier attempt did create the job, the service hands that job
+        #: back instead of creating and charging for a second one.
+        self.idempotency_key: Optional[str] = None
 
     @property
     def is_transient(self) -> bool:
@@ -45,9 +56,9 @@ class Image2PPTError(Exception):
         request may well work in a few seconds. Anything else — a 4xx, or a local
         failure with no status code at all — will answer the same way every time.
 
-        It says nothing about **writes**. Submitting is never retried on this
-        signal: a lost response cannot be told apart from a rejected request, and
-        guessing wrong charges the caller twice.
+        It says nothing about **writes**. Submitting has its own rule, built on the
+        ``Idempotency-Key`` every submission carries — see
+        ``Image2PPTClient.submit``.
         """
         return self.status_code is not None and self.status_code >= 500
 
@@ -69,9 +80,9 @@ class APIConnectionError(Image2PPTError):
     ``__cause__``, so ``raise ... from`` chaining shows it and
     ``exc.__cause__`` reaches it.
 
-    Transient: the same read is worth trying again. **A failed submission still is
-    not retried** — see ``Image2PPTError.is_transient`` for why writes are
-    different.
+    Transient: the same read is worth trying again. A submission that fails this
+    way is retried too, but only because it is resent with the same
+    ``Idempotency-Key`` — see ``Image2PPTClient.submit``.
     """
 
     @property
@@ -138,7 +149,7 @@ class InvalidFileError(Image2PPTError):
     """A file was rejected (400), or the request carried too much file content.
 
     Raised for an unsupported format, a single file over the 35MB per-file limit,
-    or a request whose files add up to more than the 45MB per-request limit
+    or a request whose files add up to more than the 90MB per-request limit
     (413 ``PAYLOAD_TOO_LARGE``). The client raises the ``PAYLOAD_TOO_LARGE`` case
     locally, before uploading anything.
     """
@@ -148,10 +159,10 @@ class UploadAbortedError(Image2PPTError):
     """The upload was cut off before the body finished arriving (400 ``UPLOAD_ABORTED``).
 
     The server is telling you it did **not** take the submission — no job was created
-    and no credits were reserved — so **resending the same files is safe**. That makes
-    this different from an ``APIConnectionError``, which cannot rule out that the job
-    was created and only the response was lost; the client never retries that one for
-    you (see ``Client._post_files``).
+    and no credits were reserved — so **resending the same files is safe**. (After an
+    ``APIConnectionError`` resending is safe too, but only with the same
+    ``idempotency_key``: that one cannot rule out that the job was created and only
+    the response was lost.)
 
     If it keeps happening, the submission is probably too large for the link. Send
     fewer files per request, or use ``submit_all`` / ``convert_all`` to split.
@@ -231,6 +242,110 @@ class RateLimitedError(Image2PPTError):
         cover this one, since a 429 is a 4xx.
         """
         return True
+
+
+class IdempotencyKeyInProgressError(Image2PPTError):
+    """An earlier request with the same ``Idempotency-Key`` is still being processed
+    (409 ``IDEMPOTENCY_KEY_IN_PROGRESS``).
+
+    Typically the first attempt timed out on this side while the service was still
+    working on it. Wait ``retry_after`` seconds and send the same request with the
+    same key: you get that job back once it exists. ``submit`` does this for you
+    before giving up.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int] = None,
+        code: Optional[str] = None,
+        retry_after: Optional[float] = None,
+    ) -> None:
+        super().__init__(message, status_code=status_code, code=code)
+        self.retry_after = retry_after
+
+    @property
+    def is_transient(self) -> bool:
+        """Always True — the earlier request will finish one way or the other."""
+        return True
+
+
+class IdempotencyKeyMismatchError(Image2PPTError):
+    """The ``Idempotency-Key`` was already used for a *different* request in the last
+    24 hours (422 ``IDEMPOTENCY_KEY_MISMATCH``).
+
+    "The same request" means the same file bytes in the same order (or the same
+    ``urls``), plus the same ``locale``, ``aspect_ratio``, ``pages`` and
+    ``callback_url``. Use a new key for a new submission.
+    """
+
+
+class InvalidIdempotencyKeyError(Image2PPTError):
+    """The ``Idempotency-Key`` is not 1–255 printable ASCII characters
+    (400 ``INVALID_IDEMPOTENCY_KEY``). Checked locally before anything is sent."""
+
+
+class InvalidCallbackUrlError(Image2PPTError):
+    """``callback_url`` was refused (400 ``INVALID_CALLBACK_URL``).
+
+    It must be ``https``, at most 2048 characters, carry no user name or password,
+    and resolve only to public addresses.
+    """
+
+
+class InvalidPagesError(Image2PPTError):
+    """``pages`` is not a valid selection (400 ``INVALID_PAGES``).
+
+    Write single pages or ``start-end`` ranges separated by commas, counting from 1,
+    e.g. ``"1-3, 7"``; at most 1000 characters. Checked locally before anything is
+    sent.
+    """
+
+
+class PagesOutOfRangeError(InvalidPagesError):
+    """``pages`` names page 0 or a page past the end of the submission
+    (400 ``PAGES_OUT_OF_RANGE``). The service's ``message`` says how many pages the
+    submission has."""
+
+
+class InvalidParameterError(Image2PPTError):
+    """A request parameter has the wrong type or value (400 ``INVALID_PARAMETER``, or
+    ``INVALID_JSON`` for a body that is not a JSON object).
+
+    Raised for more than 50 ``urls``, and by ``list_jobs`` for a bad ``limit``,
+    ``cursor``, ``created_from`` or ``created_to`` — the ``message`` says which.
+    """
+
+
+class InvalidUrlError(Image2PPTError):
+    """One of ``urls`` was refused before downloading (400 ``INVALID_URL``): not a
+    valid ``https`` URL, carrying a user name or password, or pointing at a
+    non-public address. ``index`` says which entry."""
+
+
+class UrlFetchFailedError(Image2PPTError):
+    """Downloading one of ``urls`` failed (400 ``URL_FETCH_FAILED``): it did not
+    resolve, answered non-2xx, timed out, redirected more than 4 times, or redirected
+    to ``http``. ``index`` says which entry.
+
+    Transient: the other side may simply have been down for a moment, so submitting
+    again later can work. It is not retried for you — every attempt counts against
+    the per-minute page quota.
+    """
+
+    @property
+    def is_transient(self) -> bool:
+        """Always True — see the class docstring."""
+        return True
+
+
+class WebhookVerificationError(Image2PPTError):
+    """A completion callback failed ``verify_webhook``: a header is missing, the
+    timestamp is outside the tolerance, or no signature matches.
+
+    Refuse that delivery (answer 4xx). A genuine one is retried by the service.
+    """
 
 
 class JobNotFoundError(Image2PPTError):
@@ -313,6 +428,16 @@ _CODE_TO_EXC: Dict[str, type] = {
     "JOB_ALREADY_FINISHED": JobAlreadyFinishedError,
     "NOT_READY": NotReadyError,
     "OUTPUT_EXPIRED": OutputExpiredError,
+    "IDEMPOTENCY_KEY_IN_PROGRESS": IdempotencyKeyInProgressError,
+    "IDEMPOTENCY_KEY_MISMATCH": IdempotencyKeyMismatchError,
+    "INVALID_IDEMPOTENCY_KEY": InvalidIdempotencyKeyError,
+    "INVALID_CALLBACK_URL": InvalidCallbackUrlError,
+    "INVALID_PAGES": InvalidPagesError,
+    "PAGES_OUT_OF_RANGE": PagesOutOfRangeError,
+    "INVALID_PARAMETER": InvalidParameterError,
+    "INVALID_JSON": InvalidParameterError,
+    "INVALID_URL": InvalidUrlError,
+    "URL_FETCH_FAILED": UrlFetchFailedError,
 }
 _STATUS_TO_EXC: Dict[int, type] = {
     401: AuthenticationError,
@@ -332,19 +457,28 @@ def exception_for(
     code: Optional[str],
     message: str,
     retry_after: Optional[float] = None,
+    index: Optional[int] = None,
 ) -> Image2PPTError:
     """Build the mapped exception for an error envelope."""
+    exc: Image2PPTError
     if status_code == 429:
-        return RateLimitedError(
+        exc = RateLimitedError(
             message,
             status_code=429,
             code=code or "RATE_LIMITED",
             retry_after=retry_after,
         )
-    exc_cls = _CODE_TO_EXC.get(code or "") or _STATUS_TO_EXC.get(status_code)
-    if exc_cls is None:
-        # Every 5xx is a ``ServerError``, whatever code it carries — the contract
-        # says these are server-side and worth coming back to. It still subclasses
-        # ``Image2PPTError``, so nothing catching that stops working.
-        exc_cls = ServerError if status_code >= 500 else Image2PPTError
-    return exc_cls(message, status_code=status_code, code=code)
+    elif code == "IDEMPOTENCY_KEY_IN_PROGRESS":
+        exc = IdempotencyKeyInProgressError(
+            message, status_code=status_code, code=code, retry_after=retry_after
+        )
+    else:
+        exc_cls = _CODE_TO_EXC.get(code or "") or _STATUS_TO_EXC.get(status_code)
+        if exc_cls is None:
+            # Every 5xx is a ``ServerError``, whatever code it carries — the contract
+            # says these are server-side and worth coming back to. It still subclasses
+            # ``Image2PPTError``, so nothing catching that stops working.
+            exc_cls = ServerError if status_code >= 500 else Image2PPTError
+        exc = exc_cls(message, status_code=status_code, code=code)
+    exc.index = index
+    return exc

@@ -166,8 +166,10 @@ class PageError:
 class PageResult:
     """What happened to one page of the deck.
 
-    ``page_number`` is 1-based and matches the order the files were submitted in
-    (a PDF contributes its pages in their own order). ``status`` is ``converted``
+    ``page_number`` is 1-based and counts **pages of the delivered deck**. Without
+    ``pages`` that is the order the files were submitted in (a PDF contributes its
+    pages in their own order). With ``pages`` it is the k-th *selected* page, not
+    the page number you selected: ``pages="3,7"`` gives entries 1 and 2. ``status`` is ``converted``
     when the page became editable content and ``failed`` when it did not; treat
     any other value as ``failed``.
 
@@ -219,6 +221,54 @@ class PageResult:
         )
 
 
+def _str_or_none(value: Any) -> Optional[str]:
+    """``value`` if it is a string, else None."""
+    return value if isinstance(value, str) else None
+
+
+@dataclass
+class CallbackStatus:
+    """How delivering the completion callback is going (only for jobs submitted with
+    ``callback_url``).
+
+    ``status`` is ``pending`` (the job has not finished, or the next attempt is
+    scheduled), ``delivered``, or ``failed`` (all 6 attempts failed; no more
+    retries). ``last_response_status`` is ``None`` for a network error or timeout.
+    Times are ``YYYY-MM-DD HH:MM:SS`` in UTC, or ``None``.
+
+    Read leniently, like ``PageError``: this is a report on a side channel, and a
+    surprise inside it should not cost you the job it is attached to. A field of the
+    wrong type reads as ``None``; the original is on ``raw``.
+    """
+
+    url: Optional[str]
+    status: Optional[str]  # pending | delivered | failed
+    attempts: Optional[int] = None
+    last_attempt_at: Optional[str] = None
+    last_response_status: Optional[int] = None
+    next_attempt_at: Optional[str] = None
+    raw: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Optional["CallbackStatus"]:
+        """Build it from a ``callback`` object, or return None for anything else."""
+        if not isinstance(data, dict):
+            return None
+        attempts = data.get("attempts")
+        response_status = data.get("lastResponseStatus")
+        return cls(
+            url=_str_or_none(data.get("url")),
+            status=_str_or_none(data.get("status")),
+            attempts=int(attempts) if _is_whole_number(attempts) else None,
+            last_attempt_at=_str_or_none(data.get("lastAttemptAt")),
+            last_response_status=(
+                int(response_status) if _is_whole_number(response_status) else None
+            ),
+            next_attempt_at=_str_or_none(data.get("nextAttemptAt")),
+            raw=data,
+        )
+
+
 @dataclass
 class Job:
     """A snapshot of a conversion job's state.
@@ -264,6 +314,13 @@ class Job:
     #: Appended last on purpose: the field order of this dataclass is a positional
     #: constructor signature people may already be relying on.
     page_results: Optional[List[PageResult]] = None
+    #: Delivery of the completion callback; ``None`` unless the job was submitted
+    #: with ``callback_url``.
+    callback: Optional[CallbackStatus] = None
+    #: True when ``submit`` got this job back from an earlier request with the same
+    #: ``Idempotency-Key`` (response header ``Idempotent-Replayed: true``) instead of
+    #: creating it now. Nothing was charged for the replay.
+    replayed: bool = False
 
     @property
     def is_completed(self) -> bool:
@@ -322,7 +379,41 @@ class Job:
             download_url=data.get("downloadUrl"),
             error=raw_error if isinstance(raw_error, dict) else None,
             page_results=_parse_page_results(data.get("pageResults")),
+            callback=CallbackStatus.from_dict(data.get("callback")),
             raw=data,
+        )
+
+
+@dataclass
+class JobList:
+    """One page of ``list_jobs``: API-submitted jobs, newest first.
+
+    Each job in ``data`` has the same shape as ``get_job`` returns, minus
+    ``page_results``. ``next_cursor`` is ``None`` on the last page; otherwise pass it
+    back as ``cursor`` unchanged. For reconciliation, add up each job's
+    ``credits_used`` (charged) and ``credits_refunded``.
+    """
+
+    data: List[Job]
+    next_cursor: Optional[str]
+    raw: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "JobList":
+        """Build a page, or raise ``MalformedResponseError`` if ``data`` is not a list.
+
+        ``nextCursor`` that is missing or not a string reads as the last page: an
+        unreadable cursor could not be passed back anyway, and stopping is the
+        answer that cannot loop forever.
+        """
+        body = _required(data, ("data",), "job list response")
+        if not isinstance(body["data"], list):
+            raise MalformedResponseError("malformed job list response, data must be an array")
+        cursor = body.get("nextCursor")
+        return cls(
+            data=[Job.from_dict(item) for item in body["data"]],
+            next_cursor=cursor if isinstance(cursor, str) and cursor else None,
+            raw=body,
         )
 
 

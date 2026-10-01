@@ -33,7 +33,7 @@ const names = (batches: UploadItem[][]): string[][] =>
 // --------------------------------------------------------------------------- //
 // checkFileSize — a property of the file, not of the request
 //
-// The per-file cap is STRICTER than the request cap (35MB vs 45MB), so a file can
+// The per-file cap is STRICTER than the request cap (35MB vs 90MB), so a file can
 // sit comfortably inside a request and still be rejected by the server every time.
 // --------------------------------------------------------------------------- //
 describe("checkFileSize", () => {
@@ -101,7 +101,7 @@ describe("planBatches size splitting", () => {
   });
 
   it("refuses a single oversized file — no split can help", () => {
-    // The planner applies the per-file cap, so it stops at 35MB not 45MB.
+    // The planner applies the per-file cap, so it stops at 35MB not 90MB.
     expect(() => planBatches([img("huge.png", MAX_FILE_BYTES + 1)])).toThrow(
       InvalidFileError,
     );
@@ -120,23 +120,29 @@ describe("planBatches size splitting", () => {
     expect(() => planBatches([img("doomed.pdf", between)])).toThrow(InvalidFileError);
   });
 
+  // Thirds, not halves: half the 80MB batch target is over the 35MB per-file cap.
+  const third = Math.floor(BATCH_TARGET_BYTES / 3);
+  const rest = BATCH_TARGET_BYTES - 2 * third;
+
   it("keeps a batch filled exactly to the target as one batch", () => {
-    const half = Math.floor(BATCH_TARGET_BYTES / 2);
-    const batches = planBatches([img("a", half), img("b", BATCH_TARGET_BYTES - half)]);
-    expect(names(batches)).toEqual([["a", "b"]]);
+    const batches = planBatches([img("a", third), img("b", third), img("c", rest)]);
+    expect(names(batches)).toEqual([["a", "b", "c"]]);
   });
 
   it("starts a second batch one byte past the target", () => {
-    const half = Math.floor(BATCH_TARGET_BYTES / 2);
-    const batches = planBatches([img("a", half), img("b", BATCH_TARGET_BYTES - half + 1)]);
-    expect(names(batches)).toEqual([["a"], ["b"]]);
+    const batches = planBatches([img("a", third), img("b", third), img("c", rest + 1)]);
+    expect(names(batches)).toEqual([["a", "b"], ["c"]]);
   });
 
-  it("gives two max-size files a batch each", () => {
-    // The largest legal file is 35MB, so two of them blow the 40MB batch target
-    // and must be split — neither is refused.
-    const batches = planBatches([img("a", MAX_FILE_BYTES), img("b", MAX_FILE_BYTES)]);
-    expect(names(batches)).toEqual([["a"], ["b"]]);
+  it("splits max-size files by the batch target", () => {
+    // The largest legal file is 35MB: two fit the 80MB batch target, a third would
+    // blow it and must go to a new batch — none is refused.
+    const batches = planBatches([
+      img("a", MAX_FILE_BYTES),
+      img("b", MAX_FILE_BYTES),
+      img("c", MAX_FILE_BYTES),
+    ]);
+    expect(names(batches)).toEqual([["a", "b"], ["c"]]);
   });
 });
 
@@ -192,7 +198,7 @@ describe("planBatches PDFs and ordering", () => {
 // --------------------------------------------------------------------------- //
 describe("formatBytes", () => {
   it("does not round a small overage down to zero", () => {
-    // Otherwise the error reads "45.0MB, over the 45.0MB limit (0.0MB too much)" —
+    // Otherwise the error reads "90.0MB, over the 90.0MB limit (0.0MB too much)" —
     // self-contradictory, and it looks like the check itself is broken. That is
     // exactly how it printed against the real server.
     expect(formatBytes(1)).toBe("1B");

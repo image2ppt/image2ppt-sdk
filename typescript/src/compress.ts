@@ -2,9 +2,9 @@
 
 import { Image2PPTError } from "./errors.js";
 
-export const UPLOAD_TARGET_BYTES = 1024 * 1024;
+export const UPLOAD_TARGET_BYTES = 2 * 1024 * 1024;
 export const UPLOAD_MAX_DIM = 2000;
-export const UPLOAD_QUALITY_LADDER = [90, 85, 80] as const;
+export const UPLOAD_QUALITY_LADDER = [95, 90, 85] as const;
 
 const PASSTHROUGH_MIMES = new Set(["image/png", "image/jpeg"]);
 
@@ -46,8 +46,8 @@ async function loadSharp(): Promise<SharpFactory> {
  * Match the Python SDK's image-upload preparation rules.
  *
  * PNG/JPEG images already within both byte and dimension budgets stay byte-for-byte
- * untouched. Every other supported image is flattened on white and JPEG-encoded at
- * successively lower quality settings. A dimension-compliant source is retained if
+ * untouched. Every other supported image is flattened on white and JPEG-encoded, in
+ * full colour (4:4:4), at successively lower quality settings. A dimension-compliant source is retained if
  * that re-encode would make it larger; an oversized source always uses the resized
  * JPEG so its longest edge is at most 2000px.
  *
@@ -94,7 +94,9 @@ export async function compressImageForUpload(
         withoutEnlargement: true,
       })
       .flatten({ background: "#ffffff" })
-      .jpeg({ quality })
+      // 4:4:4: sharp defaults to 4:2:0, which halves colour resolution and washes
+      // coloured small text and thin lines into the page. Same as the Python SDK.
+      .jpeg({ quality, chromaSubsampling: "4:4:4" })
       .toBuffer();
     if (compressed.byteLength <= UPLOAD_TARGET_BYTES) break;
   }

@@ -78,10 +78,147 @@ info = client.account()
 print(info["email"], "credits:", info["credits"])
 ```
 
+## Convert only some pages — `pages`
+
+```python
+job = client.submit(["report.pdf"], pages="1-3, 7")
+```
+
+Single pages and `start-end` ranges, separated by commas, counting from 1. Page numbers
+run across the **whole submission in order** — an image is one page, a PDF is its page
+count — so with a single PDF they are simply the PDF's own page numbers. Overlaps are
+merged, and the deck keeps the pages in ascending order.
+
+Only the selected pages are charged, and only they count towards the 50-page limit: a
+200-page PDF with `pages="1-50"` is fine. The spelling is checked locally before anything
+is uploaded (`InvalidPagesError`); a page past the end comes back `PagesOutOfRangeError`.
+
+With a selection, `page_results[i].page_number` is the page's place **in the deck**, not
+the number you selected: `pages="3,7"` gives entries 1 and 2.
+
+## Submit by URL — `submit_urls`
+
+Instead of uploading, hand the service `https` links and it downloads them itself:
+
+```python
+job = client.submit_urls(
+    ["https://example.com/slides/1.png", "https://example.com/report.pdf"],
+    pages="1-4",
+)
+```
+
+Up to 50 links, converted in order into one deck, held to the same limits as uploads
+(35MB per file, 90MB together, 50 pages). File types are judged by content. Links must
+be `https` and resolve to public addresses; a link that is refused raises
+`InvalidUrlError`, a download that fails raises `UrlFetchFailedError` (worth retrying
+later — the other side may have been down), and for both `e.index` says which link,
+counting from 0.
+
+Downloading takes time, so `submit_urls` waits up to 180 seconds for an answer whatever
+the client's `timeout`. One submission by URL per account can be in flight at a time;
+another gets `RateLimitedError`.
+
+## Get told when a job ends — `callback_url` and `verify_webhook`
+
+Pass `callback_url` to any submit call and the service `POST`s to it when the job ends,
+instead of you polling:
+
+```python
+job = client.submit(["slide1.png"], callback_url="https://example.com/hooks/image2ppt")
+```
+
+Every delivery is signed ([Standard Webhooks](https://www.standardwebhooks.com)). Check
+it with the **raw** request body and the signing secret from the Developer / API page:
+
+```python
+from image2ppt import verify_webhook, WebhookVerificationError
+
+# Flask shown; any framework works — pass the raw body bytes and the headers.
+@app.post("/hooks/image2ppt")
+def image2ppt_hook():
+    try:
+        event = verify_webhook(request.get_data(), request.headers, "whsec_...")
+    except WebhookVerificationError:
+        return "", 400
+    if event.type == "job.completed":
+        job = event.job          # same shape as get_job()
+        ...
+    elif event.type == "job.failed":
+        ...
+    # Ignore types you don't recognise — more may be added. Answer 2xx either way.
+    return "", 204
+```
+
+- **Pass the body exactly as received.** Parsing the JSON and serialising it again
+  changes the bytes, and the signature will not match.
+- **Answer 2xx within 10 seconds.** Anything else counts as a failure, and the service
+  retries: 6 attempts over about 8.5 hours (right away, then +1 min, +5 min, +30 min,
+  +2 h, +6 h). A retry of one delivery keeps its `event.id`, so use that to skip
+  duplicates.
+- **Timestamps more than 5 minutes off are refused**, either way, as protection against
+  replays (`tolerance_seconds` to change it).
+- A malformed secret raises `ValueError`, and a body your framework already parsed into a
+  dict raises `TypeError` — those are mistakes in your receiver, so they are kept apart
+  from a bad delivery.
+- Rotating the secret is safe: for 24 hours the service signs with both the old and the
+  new one, and either verifies.
+
+`get_job()` reports how delivery is going in `job.callback` — `status` is `pending`,
+`delivered` or `failed` (all 6 attempts failed), with `attempts`, `last_response_status`
+and the times of the last and next attempt.
+
+## Resubmitting safely — `idempotency_key`
+
+Every submission carries an `Idempotency-Key`. If the same key comes back with the same
+request within 24 hours, the service returns the job it already created —
+`job.replayed` is `True` — instead of creating and charging for a second one.
+
+That is what lets this client **resend a submission whose outcome is unknown** — a
+dropped connection, a timeout, a 5xx — without risking a double charge. It does so by
+itself, always under the same key (see *How it works*). By default the key is a random
+UUID per call. Pass your own to extend the protection across calls, processes or
+restarts:
+
+```python
+job = client.submit(paths, idempotency_key=f"order-{order.id}")
+```
+
+If a submission still fails, the key it used is on the exception:
+
+```python
+from image2ppt import APIConnectionError, ServerError
+
+try:
+    job = client.submit(paths)
+except (APIConnectionError, ServerError) as e:
+    # Later, or from another process: safe for 24 hours, because the same files,
+    # options and key can never create a second job.
+    job = client.submit(paths, idempotency_key=e.idempotency_key)
+```
+
+"The same request" means the same file bytes in the same order (or the same `urls`), and
+the same `locale`, `aspect_ratio`, `pages` and `callback_url`. Reusing a key for a
+different request raises `IdempotencyKeyMismatchError`. Keys are 1–255 printable ASCII
+characters, shared by all API keys of the account.
+
+## List your jobs — `list_jobs` / `iter_jobs`
+
+```python
+for job in client.iter_jobs(created_from="2026-10-01", created_to="2026-10-31"):
+    print(job.job_id, job.status, job.credits_used, job.credits_refunded)
+```
+
+Jobs submitted through the API, newest first; jobs deleted on the website are not
+listed. Dates are `YYYY-MM-DD` in UTC and both inclusive. `iter_jobs` follows the pages
+for you; `list_jobs` returns one page (`page.data`, `page.next_cursor`) if you want to
+page yourself — pass `next_cursor` back as `cursor`, `limit` is 1–100 (default 20).
+Each job has `get_job()`'s fields except `page_results`. For reconciliation, add up
+`credits_used` (charged) and `credits_refunded`.
+
 ## Which pages made it — `job.page_results`
 
 Once a job is terminal, it reports what happened to **every** page, in page order, one
-entry per page. `credits_refunded` tells you *how many* pages did not convert;
+entry per page of the deck (with `pages`, per *selected* page). `credits_refunded` tells you *how many* pages did not convert;
 `page_results` tells you *which ones*, and what to do about them.
 
 ```python
@@ -154,17 +291,17 @@ Whatever the language, `code` never changes with it. Keep branching on `code`.
 - **Async.** `submit` returns a job id immediately; conversion runs in the background. A single page typically takes ~2 minutes; 90% of jobs finish within 3.
 - **One job = one PPTX.** All files in a submission are merged into a single deck, in upload order.
 - **Billed per page.** 1 page = 1 credit, reserved at submit and settled on completion. If some pages fail but others succeed, the job still `completed`s with the good pages and the failed pages' credits are refunded (`credits_refunded`) — `page_results` says which pages those were.
-- **Limits.** Each file ≤ 35MB; **the files in one request ≤ 45MB in total**; ≤ 50 pages per job (images count as 1, PDFs as their page count). All three are checked locally before upload — note the per-file limit is the *stricter* one, so a 40MB PDF is refused even though it fits a request. **The sizes counted are the ones that actually go on the wire**: for an image that is its size *after* client-side compression, so a 40MB PNG that compresses to 1MB is fine. (The Node SDK compresses before upload the same way, so both clients reach the same verdict on the same file.)
-- **The check is never stricter than the documented limit.** 45MB of file content is meant to be usable, so a submission sitting exactly on it goes through. Auto-batching is the one place that is deliberately conservative — it fills a batch only to 40MB, because starting one more batch costs nothing while refusing something the server would have accepted does not.
+- **Limits.** Each file ≤ 35MB; **the files in one request ≤ 90MB in total**; ≤ 50 pages per job (images count as 1, PDFs as their page count — or, with `pages`, the pages selected). All three are checked locally before upload — note the per-file limit is the *stricter* one, so a 40MB PDF is refused even though it fits a request. **The sizes counted are the ones that actually go on the wire**: for an image that is its size *after* client-side compression, so a 40MB PNG that compresses to 2MB is fine. (The Node SDK compresses before upload the same way, so both clients reach the same verdict on the same file.)
+- **The check is never stricter than the documented limit.** 90MB of file content is meant to be usable, so a submission sitting exactly on it goes through. Auto-batching is the one place that is deliberately conservative — it fills a batch only to 40MB, because starting one more batch costs nothing while refusing something the server would have accepted does not.
 - **Only the formats the API accepts.** `png`, `jpg`/`jpeg`, `webp`, `gif`, `pdf`. Anything else raises `InvalidFileError` locally — the batch calls check every file before submitting the first one, so an unsupported file at the end of the pile cannot leave you paying for the batches ahead of it.
-- **The local page check is a lower bound.** The client does not parse PDFs, so it counts each one as *at least* 1 page. That is enough to refuse combinations that can never work (50 images plus any PDF is already 51 pages), but a submission that passes locally can still come back `TOO_MANY_SLIDES` — a 30-page PDF counts as 1 here and 30 on the server.
+- **The local page check is a lower bound.** The client does not parse PDFs, so it counts each one as *at least* 1 page. That is enough to refuse combinations that can never work (50 images plus any PDF is already 51 pages), but a submission that passes locally can still come back `TOO_MANY_SLIDES` — a 30-page PDF counts as 1 here and 30 on the server. With `pages`, the check counts the pages selected instead, and a PDF longer than 50 pages is fine.
 - **Going over the request limit is not a polite error.** Past that the connection is cut before the API can answer, so the caller sees a write timeout or a broken pipe instead of a status code. The client therefore checks locally *before* uploading and raises `InvalidFileError` (`code="PAYLOAD_TOO_LARGE"`) without sending a byte.
-- **A failed submission is never retried automatically.** A connection error only tells you the exchange broke — not whether the request body arrived. The job may not exist, or it may exist with credits already reserved and only the response lost. Retrying the second case charges you twice, and there is no idempotency key to tell them apart, so the error is raised as-is. Check `account()` or your job list before resending. (Rate limits *are* retried by `submit_all()` / `convert_all()`: a 429 is the server saying it did not take the submission.)
+- **A submission whose outcome is unknown is resent, under the same `Idempotency-Key`.** A connection error only tells you the exchange broke — not whether the request body arrived; the job may exist with credits already reserved and only the response lost. Because every attempt carries the same key, a resend of that case gets the existing job back rather than a second charge. So `submit()` resends after a dropped connection, a per-request timeout or a 5xx (up to 2 more attempts, 1s and 2s apart), and waits out `IdempotencyKeyInProgressError` — an earlier attempt the service is still working on — for up to 10 attempts or 3 minutes. Any other error is raised straight away. Whatever finally escapes carries `e.idempotency_key`; see *Resubmitting safely*.
 - **Downloads are all-or-nothing.** `download()` writes to a temporary file next to the destination and renames it into place at the end, so a dropped connection cannot leave a truncated `.pptx` behind — or destroy a good deck already sitting at that path.
 - **The 60-second request timeout is idle time, not total time.** `timeout` (default 60) is how long one request may go with **no data moving** — it is not a cap on how long a request may take. A 40MB upload or a large PPTX download that keeps making progress runs as long as it needs to; only a transfer that actually stalls is given up on, as `APITimeoutError`. A request that never gets a response at all is covered by the same clock. The Node SDK's `timeoutMs` means exactly the same thing, so the two clients behave the same way on a slow link.
 - **Every request identifies the client** with a `User-Agent` of `image2ppt-python/<version>`. The service uses this to tell SDK versions apart — it is not part of authentication and never changes a request's outcome.
 - **A deprecated SDK version logs one warning.** If this version is below the lowest the service still supports, the response carries a `Deprecation` header and the client warns once (logger `image2ppt`). Pass `warn_on_deprecated=False` to `Image2PPTClient` to silence it.
-- **Client-side pre-compression.** Images are compressed before upload (≤2000px, ≤1MB, JPEG) — the same shape the API works from, so you send fewer bytes without changing the result. PDFs are uploaded as-is.
+- **Client-side pre-compression.** Images are compressed before upload (≤2000px, ≤2MB, full-colour JPEG) — the same shape the API works from, so you send fewer bytes without changing the result. PDFs are uploaded as-is.
 
 ## More files than one request can hold
 
@@ -175,7 +312,9 @@ paths = client.convert_all(image_paths, dest_dir="decks/")
 print(paths)  # ['decks/part-01.pptx', 'decks/part-02.pptx']
 ```
 
-Batches hold at most 40MB of file content and at most 50 images; every PDF goes in a batch of its own, because the client does not parse PDFs and only the server knows their page count. `submit_all()` does the same splitting and hands back the jobs if you want to drive polling yourself. To see the plan without uploading anything, use `plan_batches()`.
+Batches hold at most 80MB of file content and at most 50 images; every PDF goes in a batch of its own, because the client does not parse PDFs and only the server knows their page count. `submit_all()` does the same splitting and hands back the jobs if you want to drive polling yourself. To see the plan without uploading anything, use `plan_batches()`.
+
+Both take `callback_url` — each batch's job calls it. They do not take `pages` or `idempotency_key`: page numbers run across one submission and a key names one job, so neither can span several batches. Each batch gets its own key, kept across that batch's retries.
 
 **Rate limits are waited out, not raised.** A pile big enough to need batching will hit the account's per-minute page quota (and its cap on concurrently active jobs). Both arrive as a `429` with a `Retry-After`; both are handled the same way — sleep that long, retry the same batch. Retrying a 429 is free: the server is saying it did *not* take the submission, so nothing was created and nothing was charged. Total waiting is capped by `rate_limit_max_wait` (default 30 min) — and **only waiting counts against it**, not the time the uploads themselves take, so a slow link cannot quietly turn the cap into "do not wait at all". A single batch is also retried at most 10 times, whatever the budget says: every retry re-uploads the whole batch, and a service still refusing after ten tries will not be talked round by more of them.
 
@@ -197,15 +336,16 @@ except Image2PPTError as e:
 
 Per account (all keys share the budget): ≤ 10 concurrent jobs, ≤ 60 pages/minute submitted. Over the limit returns `429` with a `Retry-After` hint. **Only submissions are rate limited — polling job status is not.**
 
-`submit_all()` / `convert_all()` wait these out for you: a pile big enough to need batching is a pile big enough to hit the quota, so a 429 mid-pile is the normal path, not an error. `submit()` and `convert()` do not — they submit exactly once, so catch `RateLimitedError` and honor `retry_after` yourself:
+`submit_all()` / `convert_all()` wait these out for you: a pile big enough to need batching is a pile big enough to hit the quota, so a 429 mid-pile is the normal path, not an error. `submit()`, `submit_urls()` and `convert()` do not, so catch `RateLimitedError` and honor `retry_after` yourself — resending with the same key keeps it safe:
 
 ```python
 import time
 from image2ppt import RateLimitedError
 
+key = "order-42"
 while True:
     try:
-        job = client.submit(paths)
+        job = client.submit(paths, idempotency_key=key)
         break
     except RateLimitedError as e:
         time.sleep(e.retry_after if e.retry_after is not None else 5)
@@ -213,7 +353,7 @@ while True:
 
 ## Errors
 
-Every exception this client raises about a *request* subclasses `Image2PPTError` and carries `status_code`, `code`, and `message`. Branch on `code`, not `message`. **A raw `requests` exception never reaches you** — a dropped connection, a per-request timeout, and a response body this client cannot parse all arrive as the SDK types below, with the original exception kept as `__cause__`.
+Every exception this client raises about a *request* subclasses `Image2PPTError` and carries `status_code`, `code`, and `message` — plus `index` (which of `urls` it is about, else `None`) and, out of a submit call, `idempotency_key`. Branch on `code`, not `message`. **A raw `requests` exception never reaches you** — a dropped connection, a per-request timeout, and a response body this client cannot parse all arrive as the SDK types below, with the original exception kept as `__cause__`.
 
 **Your own filesystem is the exception, deliberately.** If `download` cannot write where you asked it to, you get the operating system's `OSError` — `ENOSPC`, `EACCES`, `ENOENT` — because that names the thing you have to go and fix, and no error of ours would say it better. So catch `OSError` alongside `Image2PPTError` around `download`. The Node client draws the same line.
 
@@ -225,7 +365,16 @@ Every exception this client raises about a *request* subclasses `Image2PPTError`
 | `MalformedUploadError` | 400 | `MALFORMED_UPLOAD` — the body was not valid `multipart/form-data`; **resending identical bytes will not help** |
 | `NoFilesError` | 400 | `NO_FILES` — no files reached the server |
 | `InvalidAspectRatioError` | 400 | `INVALID_ASPECT_RATIO` — use `auto`, `16:9`, or `4:3` |
-| `TooManySlidesError` | 400 | `TOO_MANY_SLIDES` |
+| `TooManySlidesError` | 400 | `TOO_MANY_SLIDES` — also for more than 50 pages selected |
+| `InvalidPagesError` | 400 | `INVALID_PAGES` — `pages` is misspelled (also checked locally) |
+| `PagesOutOfRangeError` | 400 | `PAGES_OUT_OF_RANGE` — page 0, or past the end; subclasses `InvalidPagesError` |
+| `InvalidCallbackUrlError` | 400 | `INVALID_CALLBACK_URL` — not `https`, has credentials, over 2048 characters, or not a public address |
+| `InvalidIdempotencyKeyError` | 400 | `INVALID_IDEMPOTENCY_KEY` — not 1–255 printable ASCII characters (also checked locally) |
+| `IdempotencyKeyMismatchError` | 422 | `IDEMPOTENCY_KEY_MISMATCH` — the key was used for a different request |
+| `IdempotencyKeyInProgressError` | 409 | `IDEMPOTENCY_KEY_IN_PROGRESS` (has `retry_after`) — an earlier request with this key is still being processed |
+| `InvalidUrlError` | 400 | `INVALID_URL` — a link was refused before downloading (`e.index` says which) |
+| `UrlFetchFailedError` | 400 | `URL_FETCH_FAILED` — downloading a link failed; may be temporary (`e.index` says which) |
+| `InvalidParameterError` | 400 | `INVALID_PARAMETER`, `INVALID_JSON` — e.g. more than 50 `urls`, or a bad `list_jobs` argument |
 | `PageRateExceededError` | 400 | `PAGE_RATE_EXCEEDED` — this one submission has more pages than a minute's quota, so waiting will not help; split it |
 | `InsufficientCreditsError` | 402 | `INSUFFICIENT_CREDITS` |
 | `RateLimitedError` | 429 | `RATE_LIMITED` (has `retry_after`) |
@@ -240,6 +389,7 @@ Every exception this client raises about a *request* subclasses `Image2PPTError`
 | `APITimeoutError` | — | `REQUEST_TIMEOUT` — one HTTP request ran past the client's `timeout`; subclasses `APIConnectionError` |
 | `MalformedResponseError` | — | — (a 2xx that is not JSON, or a body missing a field the contract guarantees) |
 | `Image2PPTTimeoutError` | — | — (`wait()` exceeded its `timeout`; job may still be running) |
+| `WebhookVerificationError` | — | — (`verify_webhook` refused a delivery: missing header, stale timestamp, or no matching signature) |
 
 > **Changed in 0.5.0:** a 5xx used to arrive as the base `Image2PPTError` and now arrives as `ServerError`. `ServerError` subclasses `Image2PPTError`, so **`except Image2PPTError` code is unaffected**; only code that checked for the base class *exactly* sees a difference.
 
@@ -269,9 +419,9 @@ except Image2PPTError as e:
         time.sleep(5)  # a 5xx, a rate limit, or a network blip
 ```
 
-It is `True` for `ServerError` (any 5xx), `RateLimitedError`, `APIConnectionError` and `APITimeoutError`; `False` for everything else — including `MalformedResponseError`, on purpose: a response this client cannot parse means something other than the API answered, or the contract moved, and neither gets better by asking again.
+It is `True` for `ServerError` (any 5xx), `RateLimitedError`, `IdempotencyKeyInProgressError`, `UrlFetchFailedError`, `APIConnectionError` and `APITimeoutError`; `False` for everything else — including `MalformedResponseError`, on purpose: a response this client cannot parse means something other than the API answered, or the contract moved, and neither gets better by asking again.
 
-**It says nothing about submitting.** `submit()` is never retried on this signal, even for a transport failure that `is_transient` marks `True`. A lost response cannot be told apart from a rejected request, so retrying could create the same job twice and charge for it twice. Only a `RateLimitedError` is retried on the submit path — a 429 is the service explicitly saying it took nothing.
+**Resubmitting is only safe with the same key.** A lost response cannot be told apart from a rejected request, so resending under a *new* key could create the same job twice and charge for it twice. Resend with `e.idempotency_key`, as `submit()` itself does.
 
 ## Full API reference
 

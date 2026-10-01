@@ -8,6 +8,8 @@
  *   npx tsx step_by_step.ts slide1.png
  */
 
+import { randomUUID } from "node:crypto";
+
 import { Image2PPTClient, RateLimitedError } from "image2ppt";
 
 async function main(): Promise<number> {
@@ -24,11 +26,13 @@ async function main(): Promise<number> {
   const account = await client.account();
   console.log(`account ${account.email} — ${account.credits} credits available`);
 
-  // Submit, retrying politely if rate limited.
+  // Submit, retrying politely if rate limited. Every attempt uses the same
+  // idempotency key, so a retry can never create (and charge for) a second job.
+  const idempotencyKey = randomUUID();
   let job = await (async () => {
     for (;;) {
       try {
-        return await client.submit(paths, { aspectRatio: "auto" });
+        return await client.submit(paths, { aspectRatio: "auto", idempotencyKey });
       } catch (e) {
         if (e instanceof RateLimitedError) {
           const waitS = e.retryAfter ?? 5;

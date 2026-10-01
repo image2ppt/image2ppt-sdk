@@ -10,6 +10,7 @@ concurrently instead of blocking on convert().
 import os
 import sys
 import time
+import uuid
 
 from image2ppt import Image2PPTClient, RateLimitedError
 
@@ -27,10 +28,12 @@ def main() -> int:
     account = client.account()
     print(f"account {account['email']} — {account['credits']} credits available")
 
-    # Submit, retrying politely if rate limited.
+    # Submit, retrying politely if rate limited. Every attempt uses the same
+    # idempotency key, so a retry can never create (and charge for) a second job.
+    key = str(uuid.uuid4())
     while True:
         try:
-            job = client.submit(paths, aspect_ratio="auto")
+            job = client.submit(paths, aspect_ratio="auto", idempotency_key=key)
             break
         except RateLimitedError as e:
             wait_s = e.retry_after if e.retry_after is not None else 5

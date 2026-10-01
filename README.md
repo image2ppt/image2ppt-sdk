@@ -22,6 +22,18 @@ When a job finishes, both SDKs report the outcome **page by page** — not just 
 many pages were lost, but which ones, why, and whether the page made it into the
 deck at all. See each SDK's README.
 
+Both also cover the integration side of the API:
+
+- **Completion callbacks** — pass a callback URL and get a signed `POST` when the job
+  ends; `verify_webhook()` / `verifyWebhook()` checks the signature
+  ([Standard Webhooks](https://www.standardwebhooks.com)).
+- **Safe resubmission** — every submission carries an `Idempotency-Key`, so a
+  submission whose outcome is unknown (a dropped connection, a timeout) is resent
+  without any risk of being charged twice.
+- **Submit by URL** — hand over `https` links instead of uploading.
+- **Page selection** — convert only some pages (`"1-3, 7"`), and pay only for those.
+- **Job list** — every API job with what it charged and refunded, for reconciliation.
+
 ## Quick look
 
 ```python
@@ -42,7 +54,7 @@ console.log("done, credits used:", job.creditsUsed);
 
 ## More files than one request can hold
 
-One request carries at most 45MB of file content and 50 pages, and one file at most 35MB. Both SDKs check all three **locally, before uploading** — going over the request limit is not a polite error, the connection is simply cut before the API can answer.
+One request carries at most 90MB of file content and 50 pages (with a page selection: 50 pages selected), and one file at most 35MB. Both SDKs check all three **locally, before uploading** — going over the request limit is not a polite error, the connection is simply cut before the API can answer.
 
 For a pile bigger than that, `convert_all()` / `convertAll()` splits it into batches and writes **one PPTX per batch** (there is no server-side merge). `convert()` is unchanged: one job, one deck. Details in each SDK's README.
 

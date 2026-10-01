@@ -14,7 +14,7 @@ import re
 
 import pytest
 import requests
-from PIL import Image
+from PIL import Image, JpegImagePlugin
 
 from image2ppt import (
     MAX_FILE_BYTES,
@@ -27,6 +27,8 @@ from image2ppt import (
     Image2PPTClient,
     Image2PPTError,
     Image2PPTTimeoutError,
+    IdempotencyKeyInProgressError,
+    IdempotencyKeyMismatchError,
     InsufficientCreditsError,
     InvalidAspectRatioError,
     InvalidFileError,
@@ -627,6 +629,8 @@ def test_compress_large_image_shrinks_to_jpeg():
     assert len(out) < len(raw)
     with Image.open(io.BytesIO(out)) as img:
         assert max(img.size) <= 2000
+        # 0 = 4:4:4. Pillow's default 4:2:0 would halve colour resolution.
+        assert JpegImagePlugin.get_sampling(img) == 0
 
 
 def test_compress_transparent_flattened_to_jpeg():
@@ -672,12 +676,13 @@ def exploding_handler(*_args, **_kwargs):
 
 
 def test_submit_refuses_oversized_batch_without_sending_anything(tmp_path):
-    """Two individually-legal files that add up past the request cap: rejected
-    before a connection is opened."""
-    half = MAX_UPLOAD_BYTES // 2
+    """Individually-legal files that add up past the request cap: rejected
+    before a connection is opened. (Thirds: half the cap is over the per-file cap.)"""
+    third = MAX_UPLOAD_BYTES // 3
     files = [
-        sparse_file(tmp_path, "a.pdf", half),
-        sparse_file(tmp_path, "b.pdf", half + 1),
+        sparse_file(tmp_path, "a.pdf", third),
+        sparse_file(tmp_path, "b.pdf", third),
+        sparse_file(tmp_path, "c.pdf", MAX_UPLOAD_BYTES - 2 * third + 1),
     ]
     client, session = client_and_session(exploding_handler)
 
@@ -787,38 +792,46 @@ def test_convert_all_writes_one_numbered_pptx_per_batch(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# a failed submission is NOT retried
+# a submission whose outcome is unknown is resent — under the SAME key
 #
-# This looks like a missing feature; it is a deliberate one. An APIConnectionError
-# proves only that the exchange broke — the server may have received the whole
-# body, created the job and reserved credits, and then lost the connection while
-# answering. Retrying that case charges the user twice. Nothing here can tell the
-# two apart without an idempotency key the API does not offer, so the error goes
-# to the caller untouched. These tests exist so nobody quietly adds the retry back.
+# An APIConnectionError proves only that the exchange broke: the server may have
+# received the whole body, created the job and reserved credits, and then lost the
+# connection while answering. Resending is safe only because every attempt carries
+# the same Idempotency-Key, so the service hands back the job it already made. These
+# tests pin both halves: it is resent, and never under a new key.
 # --------------------------------------------------------------------------- #
-def test_submit_does_not_retry_a_broken_connection(tmp_path):
+def sent_keys(session):
+    return [call[2]["headers"]["Idempotency-Key"] for call in session.calls if call[0] == "POST"]
+
+
+def test_submit_resends_a_broken_connection_under_the_same_key(tmp_path, no_sleep):
     img = tmp_path / "a.png"
     img.write_bytes(png_bytes())
     attempts = {"n": 0}
 
     def handler(*_args, **_kwargs):
         attempts["n"] += 1
-        raise requests.exceptions.ConnectionError(
-            "('Connection aborted.', TimeoutError('The write operation timed out'))"
+        if attempts["n"] == 1:
+            raise requests.exceptions.ConnectionError(
+                "('Connection aborted.', TimeoutError('The write operation timed out'))"
+            )
+        return FakeResponse(
+            201,
+            {"jobId": "job_1", "status": "pending"},
+            headers={"Idempotent-Replayed": "true"},
         )
 
     client, session = client_and_session(handler)
+    job = client.submit([str(img)])
 
-    with pytest.raises(APIConnectionError) as exc:
-        client.submit([str(img)])
+    assert job.job_id == "job_1"
+    assert job.replayed is True
+    keys = sent_keys(session)
+    assert len(keys) == 2 and keys[0] == keys[1]
+    assert no_sleep == [1.0]
 
-    assert isinstance(exc.value.__cause__, requests.exceptions.ConnectionError)
-    assert attempts["n"] == 1  # tried exactly once
-    assert len(posted_filenames(session)) == 1
 
-
-def test_submit_does_not_retry_a_read_timeout(tmp_path):
-    """The body was sent, so the job may exist with credits reserved."""
+def test_submit_gives_up_after_two_resends_and_hands_back_the_key(tmp_path, no_sleep):
     img = tmp_path / "a.png"
     img.write_bytes(png_bytes())
 
@@ -828,17 +841,105 @@ def test_submit_does_not_retry_a_read_timeout(tmp_path):
     client, session = client_and_session(handler)
 
     with pytest.raises(APITimeoutError) as exc:
-        client.submit([str(img)])
+        client.submit([str(img)], idempotency_key="order-42")
 
-    # The per-request timeout is still a transport failure, so one except clause
-    # covers both — but it keeps its own class, because the answer differs.
     assert isinstance(exc.value, APIConnectionError)
     assert exc.value.code == "REQUEST_TIMEOUT"
     assert isinstance(exc.value.__cause__, requests.exceptions.ReadTimeout)
-    assert len(posted_filenames(session)) == 1
+    assert sent_keys(session) == ["order-42"] * 3
+    assert exc.value.idempotency_key == "order-42"
+    assert no_sleep == [1.0, 2.0]
 
 
-def test_submit_all_does_not_retry_a_broken_connection_either(tmp_path):
+def test_submit_resends_a_5xx_under_the_same_key(tmp_path, no_sleep):
+    img = tmp_path / "a.png"
+    img.write_bytes(png_bytes())
+    responses = iter([
+        FakeResponse(502, raise_json=True),
+        FakeResponse(201, {"jobId": "job_1", "status": "pending"}),
+    ])
+    client, session = client_and_session(lambda *a, **k: next(responses))
+
+    job = client.submit([str(img)])
+
+    assert job.job_id == "job_1" and job.replayed is False
+    assert len(set(sent_keys(session))) == 1 and len(sent_keys(session)) == 2
+
+
+def test_submit_waits_out_an_earlier_attempt_still_in_progress(tmp_path, no_sleep):
+    img = tmp_path / "a.png"
+    img.write_bytes(png_bytes())
+    in_progress = FakeResponse(
+        409,
+        {"error": {"code": "IDEMPOTENCY_KEY_IN_PROGRESS", "message": "busy"}},
+        headers={"Retry-After": "2"},
+    )
+    responses = iter([in_progress, in_progress, FakeResponse(201, {"jobId": "j", "status": "pending"})])
+    client, session = client_and_session(lambda *a, **k: next(responses))
+
+    assert client.submit([str(img)]).job_id == "j"
+    assert no_sleep == [2.0, 3.0]  # Retry-After, then half as long again
+    assert len(set(sent_keys(session))) == 1
+
+
+def test_submit_stops_waiting_on_in_progress_after_ten_attempts(tmp_path, no_sleep):
+    img = tmp_path / "a.png"
+    img.write_bytes(png_bytes())
+    in_progress = FakeResponse(
+        409,
+        {"error": {"code": "IDEMPOTENCY_KEY_IN_PROGRESS", "message": "busy"}},
+        headers={"Retry-After": "1"},
+    )
+    client, session = client_and_session(lambda *a, **k: in_progress)
+
+    with pytest.raises(IdempotencyKeyInProgressError) as exc:
+        client.submit([str(img)])
+
+    assert len(session.calls) == 10
+    assert exc.value.retry_after == 1.0
+    assert exc.value.is_transient
+    assert exc.value.idempotency_key == sent_keys(session)[0]
+
+
+def test_a_mismatch_after_a_lost_attempt_says_a_job_was_made(tmp_path, no_sleep):
+    img = tmp_path / "a.png"
+    img.write_bytes(png_bytes())
+    state = {"n": 0}
+
+    def handler(*_a, **_k):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise requests.exceptions.ConnectionError("reset")
+        return FakeResponse(
+            422, {"error": {"code": "IDEMPOTENCY_KEY_MISMATCH", "message": "different request"}}
+        )
+
+    with pytest.raises(IdempotencyKeyMismatchError) as exc:
+        make_client(handler).submit([str(img)])
+
+    assert exc.value.status_code == 422
+    assert "list_jobs" in str(exc.value)
+
+
+def test_a_rejected_submission_is_not_resent(tmp_path, no_sleep):
+    img = tmp_path / "a.png"
+    img.write_bytes(png_bytes())
+    client, session = client_and_session(
+        lambda *a, **k: FakeResponse(
+            402, {"error": {"code": "INSUFFICIENT_CREDITS", "message": "no credits"}}
+        )
+    )
+
+    with pytest.raises(InsufficientCreditsError) as exc:
+        client.submit([str(img)])
+
+    assert len(session.calls) == 1
+    assert exc.value.idempotency_key == sent_keys(session)[0]
+
+
+def test_submit_all_gives_each_batch_its_own_key_and_keeps_it_across_resends(
+    tmp_path, no_sleep
+):
     """And the jobs already created still come back on the exception."""
     paths = make_images(tmp_path, MAX_PAGES_PER_JOB + 1)
     state = {"n": 0}
@@ -854,7 +955,9 @@ def test_submit_all_does_not_retry_a_broken_connection_either(tmp_path):
     with pytest.raises(APIConnectionError) as exc:
         client.submit_all(paths)
 
-    assert len(posted_filenames(session)) == 2  # batch 1, then batch 2 once
+    keys = sent_keys(session)
+    assert len(keys) == 4  # batch 1, then batch 2 three times
+    assert keys[0] != keys[1] and keys[1] == keys[2] == keys[3]
     assert [job.job_id for job in exc.value.submitted_jobs] == ["job_a"]
 
 
@@ -976,7 +1079,7 @@ def test_convert_all_hands_back_jobs_when_a_later_one_fails(tmp_path):
 # per-file limit and destination checks — both must fail before spending money
 # --------------------------------------------------------------------------- #
 def test_submit_refuses_a_single_file_over_the_per_file_limit(tmp_path):
-    """It fits the 45MB request cap, but the server rejects it every time."""
+    """It fits the 90MB request cap, but the server rejects it every time."""
     big = sparse_file(tmp_path, "big.pdf", MAX_FILE_BYTES + 1)
     client, session = client_and_session(exploding_handler)
 
@@ -1912,24 +2015,6 @@ def test_wait_gives_up_immediately_on_an_auth_failure():
         ).wait("j", poll_interval=0)
 
 
-def test_a_transient_error_still_does_not_make_a_submission_retry(tmp_path):
-    """is_transient answers "is this read worth repeating". Submitting twice costs
-    money, so it must not leak onto the submit path."""
-    img = tmp_path / "a.png"
-    img.write_bytes(png_bytes())
-
-    def handler(*_a, **_k):
-        raise requests.ConnectionError("connection reset")
-
-    client, session = client_and_session(handler)
-
-    with pytest.raises(APIConnectionError) as exc:
-        client.submit([str(img)])
-
-    assert exc.value.is_transient  # it is, for a read
-    assert len(session.calls) == 1  # and it still went out exactly once
-
-
 # --------------------------------------------------------------------------- #
 # pageResults — the per-page ledger
 #
@@ -2285,12 +2370,16 @@ def test_a_malformed_page_error_reads_the_same_in_both_clients(
     assert page_error.retryable is retryable
 
 
-def test_page_results_sit_last_in_the_dataclass():
-    """Guards the positional-constructor order test: page_results is appended at
-    the end, so no existing positional call changes meaning."""
+def test_new_job_fields_are_appended_after_the_old_ones():
+    """Guards the positional-constructor order test: fields are only ever appended
+    at the end, so no existing positional call changes meaning."""
     import dataclasses
 
-    assert [f.name for f in dataclasses.fields(Job)][-1] == "page_results"
+    assert [f.name for f in dataclasses.fields(Job)][-3:] == [
+        "page_results",
+        "callback",
+        "replayed",
+    ]
 
 
 # --------------------------------------------------------------------------- #

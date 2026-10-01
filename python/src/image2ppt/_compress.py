@@ -11,9 +11,9 @@ import io
 
 from PIL import Image
 
-_UPLOAD_TARGET_BYTES = 1024 * 1024
+_UPLOAD_TARGET_BYTES = 2 * 1024 * 1024
 _UPLOAD_MAX_DIM = 2000
-_UPLOAD_QUALITY_LADDER = (90, 85, 80)
+_UPLOAD_QUALITY_LADDER = (95, 90, 85)
 # Only PNG / JPEG pass through as-is; WebP / GIF are transcoded to JPEG even when
 # small, since those are the two formats this spec passes through unchanged.
 _PASSTHROUGH_MIMES = frozenset({"image/png", "image/jpeg"})
@@ -24,9 +24,10 @@ def compress_image_for_upload(raw: bytes, mime: str) -> "tuple[bytes, str]":
     """Compress an image to the upload spec; return ``(bytes, mime)``.
 
     Rules, shared with the Node SDK:
-      - PNG/JPEG with longest edge <= 2000px and <= 1MB -> returned as-is (passthrough).
+      - PNG/JPEG with longest edge <= 2000px and <= 2MB -> returned as-is (passthrough).
       - Otherwise: fit inside 2000x2000 (shrink only), flatten transparency onto
-        white, JPEG at quality 90 -> 85 -> 80 until <= 1MB or the ladder bottoms out.
+        white, full-colour (4:4:4) JPEG at quality 95 -> 90 -> 85 until <= 2MB or the
+        ladder bottoms out.
       - Fallback: if compression somehow yields a larger file (already-low-quality
         sources do this) -> return the original, never "blurrier AND bigger".
 
@@ -61,7 +62,9 @@ def compress_image_for_upload(raw: bytes, mime: str) -> "tuple[bytes, str]":
         compressed = None
         for quality in _UPLOAD_QUALITY_LADDER:
             buffer = io.BytesIO()
-            scaled.save(buffer, format="JPEG", quality=quality)
+            # subsampling=0 is 4:4:4. Pillow defaults to 4:2:0, which halves colour
+            # resolution and washes coloured small text and thin lines into the page.
+            scaled.save(buffer, format="JPEG", quality=quality, subsampling=0)
             compressed = buffer.getvalue()
             if len(compressed) <= _UPLOAD_TARGET_BYTES:
                 break

@@ -15,11 +15,14 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import sharp from "sharp";
+import { withoutSleeping } from "./helpers.js";
 
 import {
   APIConnectionError,
   APITimeoutError,
   AuthenticationError,
+  IdempotencyKeyInProgressError,
+  IdempotencyKeyMismatchError,
   Image2PPTClient,
   Image2PPTError,
   Image2PPTTimeoutError,
@@ -46,6 +49,7 @@ import {
   UploadAbortedError,
   VERSION,
 } from "../src/index.js";
+import { UPLOAD_QUALITY_LADDER, UPLOAD_TARGET_BYTES } from "../src/compress.js";
 
 function json(status: number, body: unknown, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -741,19 +745,28 @@ describe("client-side image preparation", () => {
     expect([...decoded.data.subarray(0, 3)]).toEqual([255, 255, 255]);
   });
 
-  it("uses the first JPEG quality step that fits in 1MiB", async () => {
-    const file = await noisyPng("quality.png", 1150, 1150);
+  it("uses the first full-colour JPEG quality step that fits the upload budget", async () => {
+    // Noise sized so the top rung is over the budget and a lower one fits.
+    const file = await noisyPng("quality.png", 1100, 1100);
     const source = await readFile(file);
-    const q90 = await sharp(source).flatten({ background: "#ffffff" }).jpeg({ quality: 90 }).toBuffer();
-    const q85 = await sharp(source).flatten({ background: "#ffffff" }).jpeg({ quality: 85 }).toBuffer();
-    expect(q90.byteLength).toBeGreaterThan(1024 * 1024);
-    expect(q85.byteLength).toBeLessThanOrEqual(1024 * 1024);
+    const rungs = await Promise.all(
+      UPLOAD_QUALITY_LADDER.map((quality) =>
+        sharp(source)
+          .flatten({ background: "#ffffff" })
+          .jpeg({ quality, chromaSubsampling: "4:4:4" })
+          .toBuffer(),
+      ),
+    );
+    expect(rungs[0]!.byteLength).toBeGreaterThan(UPLOAD_TARGET_BYTES);
+    const expected = rungs.find((r) => r.byteLength <= UPLOAD_TARGET_BYTES) ?? rungs.at(-1)!;
     const f = fetchSequence(json(201, { jobId: "j", status: "pending" }));
 
     await client(f).submit([file]);
 
     const [part] = (await postedFiles(f))[0]!;
-    expect(part!.body.equals(q85)).toBe(true);
+    expect(part!.body.equals(expected)).toBe(true);
+    // 4:4:4, not sharp's default 4:2:0 (which halves colour resolution).
+    expect((await sharp(part!.body).metadata()).chromaSubsampling).toBe("4:4:4");
   });
 
   it("keeps an in-bounds image when its JPEG re-encode would be larger", async () => {
@@ -788,7 +801,7 @@ describe("client-side image preparation", () => {
   });
 
   it("runs pre-flight and batch planning from compressed image sizes", async () => {
-    const files = [await flatPng("one.png", 3200, 3200), await flatPng("two.png", 3200, 3200)];
+    const files = [await flatPng("one.png", 4000, 4000), await flatPng("two.png", 4000, 4000)];
     expect((await stat(files[0]!)).size + (await stat(files[1]!)).size).toBeGreaterThan(
       MAX_UPLOAD_BYTES,
     );
@@ -986,11 +999,13 @@ async function manyImages(count: number): Promise<string[]> {
 
 describe("upload size guard", () => {
   it("refuses an oversized batch without sending anything", async () => {
-    // Two individually-legal files that add up past the request cap.
-    const half = Math.floor(MAX_UPLOAD_BYTES / 2);
+    // Individually-legal files that add up past the request cap. (Thirds: half the
+    // cap is over the per-file cap.)
+    const third = Math.floor(MAX_UPLOAD_BYTES / 3);
     const files = [
-      await sparseFile("a.pdf", half),
-      await sparseFile("b.pdf", half + 1),
+      await sparseFile("a.pdf", third),
+      await sparseFile("b.pdf", third),
+      await sparseFile("c.pdf", MAX_UPLOAD_BYTES - 2 * third + 1),
     ];
     const f = fetchScript(() => {
       throw new Error("no HTTP request should have been made");
@@ -1084,81 +1099,175 @@ describe("convertAll", () => {
 });
 
 // --------------------------------------------------------------------------- //
-// a failed submission is NOT retried
+// a submission whose outcome is unknown is resent — under the SAME key
 //
-// This looks like a missing feature; it is a deliberate one. A network error
-// proves only that the exchange broke — the server may have received the whole
-// body, created the job and reserved credits, and then lost the connection while
-// answering. Retrying that case charges the user twice. Nothing here can tell the
-// two apart without an idempotency key the API does not offer, so the error goes
-// to the caller untouched. These tests exist so nobody quietly adds the retry back.
+// A network error proves only that the exchange broke: the server may have
+// received the whole body, created the job and reserved credits, and then lost the
+// connection while answering. Resending is safe only because every attempt carries
+// the same Idempotency-Key, so the service hands back the job it already made.
+// These tests pin both halves: it is resent, and never under a new key.
 // --------------------------------------------------------------------------- //
-describe("no automatic submit retry", () => {
-  it("does not retry a broken connection", async () => {
-    // The failure is now reported as an SDK error rather than escaping as undici's
-    // raw TypeError, but the invariant this test guards is unchanged and is the
-    // whole point: exactly one attempt.
+/** The Idempotency-Key each POST carried, in order. */
+function sentKeys(f: RecordingFetch): string[] {
+  return f.calls
+    .filter((call) => call.init.method === "POST")
+    .map((call) => (call.init.headers as Record<string, string>)["Idempotency-Key"]!);
+}
+
+describe("submit resends under the same key", () => {
+  it("resends a broken connection under the same key", async () => {
     const file = await tempFile();
-    const f = fetchScript(() => {
-      throw new TypeError("fetch failed");
+    const f = fetchScript((n) => {
+      if (n === 1) throw new TypeError("fetch failed");
+      return json(201, { jobId: "job_1", status: "pending" }, { "Idempotent-Replayed": "true" });
     });
 
-    await expect(client(f).submit([file])).rejects.toBeInstanceOf(APIConnectionError);
-    expect(f.calls).toHaveLength(1); // tried exactly once
+    const { result: job, delays } = await withoutSleeping(() => client(f).submit([file]));
+
+    expect(job.jobId).toBe("job_1");
+    expect(job.replayed).toBe(true);
+    const keys = sentKeys(f);
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).toBe(keys[1]);
+    expect(delays).toEqual([1_000]);
   });
 
-  it("does not retry a request it timed out", async () => {
-    // Driven by the real idle watchdog against a server that never answers, not by
-    // a fake fetch throwing a ready-made abort: the point is that a stalled
-    // submission is given up on exactly once, and that only holds if the thing
-    // giving up is the client's own timeout.
+  it("gives up on a stalled submission after two resends and hands back the key", async () => {
+    // Driven by the real idle watchdog against a server that never answers: the
+    // thing giving up each time is the client's own timeout.
     const file = await tempFile();
     const f = stallingFetch();
 
-    await expect(
-      impatientClient(f).submit([file]),
-    ).rejects.toBeInstanceOf(APITimeoutError);
-    expect(f.calls).toHaveLength(1);
+    const { result: err, delays } = await withoutSleeping(() =>
+      impatientClient(f)
+        .submit([file], { idempotencyKey: "order-42" })
+        .catch((e: unknown) => e),
+    );
+
+    expect(err).toBeInstanceOf(APITimeoutError);
+    expect(err).toBeInstanceOf(APIConnectionError);
+    expect((err as APITimeoutError).code).toBe("REQUEST_TIMEOUT");
+    expect((err as APITimeoutError).idempotencyKey).toBe("order-42");
+    expect(sentKeys(f)).toEqual(["order-42", "order-42", "order-42"]);
+    expect(delays).toEqual([1_000, 2_000]);
   });
 
-  it("does not retry an abort raised by a caller-supplied fetch", async () => {
-    // A custom `fetch` may enforce a deadline of its own and abort with a bare
-    // DOMException. It is still a timeout, and still must not be retried.
+  it("treats an abort raised by a caller-supplied fetch as a timeout, and resends it", async () => {
     const file = await tempFile();
     const f = fetchScript(() => {
       throw new DOMException("The operation was aborted", "TimeoutError");
     });
 
-    await expect(client(f).submit([file])).rejects.toMatchObject({
-      name: "APITimeoutError",
-      code: "REQUEST_TIMEOUT",
-    });
-    expect(f.calls).toHaveLength(1);
+    const { result: err } = await withoutSleeping(() =>
+      client(f).submit([file]).catch((e: unknown) => e),
+    );
+
+    expect(err).toMatchObject({ name: "APITimeoutError", code: "REQUEST_TIMEOUT" });
+    expect(f.calls).toHaveLength(3);
+    expect(new Set(sentKeys(f)).size).toBe(1);
   });
 
-  it("does not retry an HTTP error answer", async () => {
+  it("resends a 5xx under the same key", async () => {
+    const file = await tempFile();
+    const f = fetchSequence(
+      new Response("<html>bad gateway</html>", { status: 502 }),
+      json(201, { jobId: "job_1", status: "pending" }),
+    );
+
+    const { result: job } = await withoutSleeping(() => client(f).submit([file]));
+
+    expect(job.jobId).toBe("job_1");
+    expect(job.replayed).toBe(false);
+    expect(sentKeys(f)).toHaveLength(2);
+    expect(new Set(sentKeys(f)).size).toBe(1);
+  });
+
+  it("waits out an earlier attempt still in progress", async () => {
+    const file = await tempFile();
+    const inProgress = (): Response =>
+      json(
+        409,
+        { error: { code: "IDEMPOTENCY_KEY_IN_PROGRESS", message: "busy" } },
+        { "Retry-After": "2" },
+      );
+    const f = fetchSequence(inProgress(), inProgress(), json(201, { jobId: "j", status: "pending" }));
+
+    const { result: job, delays } = await withoutSleeping(() => client(f).submit([file]));
+
+    expect(job.jobId).toBe("j");
+    expect(delays).toEqual([2_000, 3_000]); // Retry-After, then half as long again
+    expect(new Set(sentKeys(f)).size).toBe(1);
+  });
+
+  it("stops waiting on in-progress after ten attempts", async () => {
+    const file = await tempFile();
+    const f = fetchScript(() =>
+      json(
+        409,
+        { error: { code: "IDEMPOTENCY_KEY_IN_PROGRESS", message: "busy" } },
+        { "Retry-After": "1" },
+      ),
+    );
+
+    const { result: err } = await withoutSleeping(() =>
+      client(f).submit([file]).catch((e: unknown) => e),
+    );
+
+    expect(err).toBeInstanceOf(IdempotencyKeyInProgressError);
+    expect(f.calls).toHaveLength(10);
+    const inProgress = err as IdempotencyKeyInProgressError;
+    expect(inProgress.retryAfter).toBe(1);
+    expect(inProgress.isTransient).toBe(true);
+    expect(inProgress.idempotencyKey).toBe(sentKeys(f)[0]);
+  });
+
+  it("says a job was made when a mismatch follows a lost attempt", async () => {
+    const file = await tempFile();
+    const f = fetchScript((n) => {
+      if (n === 1) throw new TypeError("fetch failed");
+      return json(422, {
+        error: { code: "IDEMPOTENCY_KEY_MISMATCH", message: "different request" },
+      });
+    });
+
+    const { result: err } = await withoutSleeping(() =>
+      client(f).submit([file]).catch((e: unknown) => e),
+    );
+
+    expect(err).toBeInstanceOf(IdempotencyKeyMismatchError);
+    expect((err as IdempotencyKeyMismatchError).statusCode).toBe(422);
+    expect((err as Error).message).toContain("listJobs");
+  });
+
+  it("does not resend a rejected submission", async () => {
     const file = await tempFile();
     const f = fetchSequence(
       json(402, { error: { code: "INSUFFICIENT_CREDITS", message: "no" } }),
     );
 
-    await expect(client(f).submit([file])).rejects.toBeInstanceOf(InsufficientCreditsError);
+    const err = await client(f).submit([file]).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(InsufficientCreditsError);
     expect(f.calls).toHaveLength(1);
+    expect((err as InsufficientCreditsError).idempotencyKey).toBe(sentKeys(f)[0]);
   });
 
-  it("does not retry inside submitAll either, and still hands back the jobs", async () => {
+  it("gives each submitAll batch its own key and keeps it across resends", async () => {
     const files = await manyImages(MAX_PAGES_PER_JOB + 1);
-    let n = 0;
-    const f = fetchScript(() => {
-      n += 1;
+    const f = fetchScript((n) => {
       if (n === 1) return json(201, { jobId: "job_a", status: "pending" });
       throw new TypeError("fetch failed");
     });
 
-    const err = await client(f).submitAll(files).catch((e: unknown) => e);
+    const { result: err } = await withoutSleeping(() =>
+      client(f).submitAll(files).catch((e: unknown) => e),
+    );
 
     expect(err).toBeInstanceOf(APIConnectionError);
-    expect(f.calls).toHaveLength(2); // batch 1, then batch 2 once
+    const keys = sentKeys(f);
+    expect(keys).toHaveLength(4); // batch 1, then batch 2 three times
+    expect(keys[0]).not.toBe(keys[1]);
+    expect(new Set(keys.slice(1)).size).toBe(1);
     expect(submittedIds(err)).toEqual(["job_a"]);
   });
 });
@@ -1302,7 +1411,7 @@ describe("submitAll rate limiting", () => {
 // --------------------------------------------------------------------------- //
 describe("per-file limit", () => {
   it("refuses a single file over the per-file limit", async () => {
-    // It fits the 45MB request cap, but the server rejects it every time.
+    // It fits the 90MB request cap, but the server rejects it every time.
     const big = await sparseFile("big.pdf", MAX_FILE_BYTES + 1);
     const f = fetchScript(() => {
       throw new Error("no HTTP request should have been made");

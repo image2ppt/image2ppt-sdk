@@ -7,4 +7,4 @@
  *
  * Do not read `package.json` at runtime: ESM + bundlers will not resolve it.
  */
-export const VERSION = "0.5.3";
+export const VERSION = "0.6.0";

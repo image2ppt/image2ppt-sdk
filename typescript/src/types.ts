@@ -35,7 +35,7 @@ export type PageStatus = "converted" | "failed";
  *
  * `what` names the envelope for the message ("job response").
  */
-function isJsonObject(value: unknown): value is Record<string, any> {
+export function isJsonObject(value: unknown): value is Record<string, any> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -123,7 +123,12 @@ export class PageError {
 
 /** What happened to one page of the deck. */
 export class PageResult {
-  /** 1-based, in the order the pages were submitted (a PDF follows its own page order). */
+  /**
+   * 1-based, and counts **pages of the delivered deck**. Without `pages` that is the
+   * order the files were submitted in (a PDF follows its own page order). With
+   * `pages` it is the k-th *selected* page, not the page number you selected:
+   * `pages: "3,7"` gives entries 1 and 2.
+   */
   readonly pageNumber: number;
   /** `converted` or `failed`; an unrecognised value is passed through as-is. */
   readonly status: PageStatus;
@@ -215,7 +220,8 @@ export interface ClientOptions {
   warnOnDeprecated?: boolean;
 }
 
-export interface SubmitOptions {
+/** Options every kind of submission takes, including the batch calls. */
+export interface SubmitAllOptions {
   /**
    * Language of the **generated deck**: `zh-CN` (default) or `en`.
    *
@@ -225,6 +231,34 @@ export interface SubmitOptions {
   locale?: Locale;
   /** `auto` (default) / `16:9` / `4:3`. */
   aspectRatio?: AspectRatio;
+  /**
+   * An `https` URL the service POSTs to when the job ends. Check each delivery with
+   * `verifyWebhook`. With `submitAll`, every batch's job calls it.
+   */
+  callbackUrl?: string;
+}
+
+/**
+ * Options for one submission (`submit`, `submitUrls`, `convert`).
+ *
+ * `pages` and `idempotencyKey` exist only here, not on `SubmitAllOptions`: page
+ * numbers run across one submission and a key names one job, so neither can span
+ * the several batches `submitAll` makes.
+ */
+export interface SubmitOptions extends SubmitAllOptions {
+  /**
+   * Convert only these pages, e.g. `"1-3, 7"`. Page numbers run across the whole
+   * submission in order — an image is one page, a PDF its page count — so with a
+   * single PDF they are the PDF's own. Only the selected pages are charged and count
+   * towards the 50-page limit; the PDF itself may be longer.
+   */
+  pages?: string;
+  /**
+   * 1–255 printable ASCII characters. Default: a random UUID per call. Pass your own
+   * to make resubmitting safe across calls or processes — e.g. an id from your own
+   * database.
+   */
+  idempotencyKey?: string;
 }
 
 export interface WaitOptions {
@@ -235,6 +269,19 @@ export interface WaitOptions {
 }
 
 export type ConvertOptions = SubmitOptions & WaitOptions;
+
+export type ConvertAllOptions = SubmitAllOptions & WaitOptions;
+
+export interface ListJobsOptions {
+  /** `YYYY-MM-DD` in UTC, inclusive. */
+  createdFrom?: string;
+  /** `YYYY-MM-DD` in UTC, inclusive. */
+  createdTo?: string;
+  /** Jobs per page, 1–100 (default 20). */
+  limit?: number;
+  /** `nextCursor` from the previous page, passed back unchanged. */
+  cursor?: string;
+}
 
 export interface Account {
   email: string;
@@ -308,6 +355,54 @@ function parsePageResults(value: unknown): PageResult[] | null {
   return value.map((entry) => new PageResult(entry as Record<string, unknown>));
 }
 
+/** A whole number: `3` and `3.0` count, `"3"`, `true` and `1.5` do not. */
+export function wholeNumber(value: unknown): number | null {
+  return Number.isInteger(value) ? (value as number) : null;
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+/**
+ * How delivering the completion callback is going (only for jobs submitted with
+ * `callbackUrl`).
+ *
+ * `status` is `pending` (the job has not finished, or the next attempt is
+ * scheduled), `delivered`, or `failed` (all 6 attempts failed; no more retries).
+ * `lastResponseStatus` is `null` for a network error or timeout. Times are
+ * `YYYY-MM-DD HH:MM:SS` in UTC, or `null`.
+ *
+ * Read leniently, like `PageError`: this is a report on a side channel, and a
+ * surprise inside it should not cost you the job it is attached to. A field of the
+ * wrong type reads as `null`; the original is on `raw`.
+ */
+export class CallbackStatus {
+  readonly url: string | null;
+  /** `pending` | `delivered` | `failed`. */
+  readonly status: string | null;
+  readonly attempts: number | null;
+  readonly lastAttemptAt: string | null;
+  readonly lastResponseStatus: number | null;
+  readonly nextAttemptAt: string | null;
+  readonly raw: Record<string, unknown>;
+
+  constructor(data: Record<string, unknown>) {
+    this.url = stringOrNull(data.url);
+    this.status = stringOrNull(data.status);
+    this.attempts = wholeNumber(data.attempts);
+    this.lastAttemptAt = stringOrNull(data.lastAttemptAt);
+    this.lastResponseStatus = wholeNumber(data.lastResponseStatus);
+    this.nextAttemptAt = stringOrNull(data.nextAttemptAt);
+    this.raw = data;
+  }
+
+  /** Build it from a `callback` value, or return null for anything but an object. */
+  static fromJson(value: unknown): CallbackStatus | null {
+    return isJsonObject(value) ? new CallbackStatus(value) : null;
+  }
+}
+
 /** A snapshot of a conversion job's state. */
 export class Job {
   readonly jobId: string;
@@ -348,6 +443,15 @@ export class Job {
    * which is the confusion `null` exists to prevent.
    */
   readonly pageResults: PageResult[] | null;
+  /** Delivery of the completion callback; `null` unless submitted with `callbackUrl`. */
+  readonly callback: CallbackStatus | null;
+  /**
+   * True when `submit` got this job back from an earlier request with the same
+   * `Idempotency-Key` (response header `Idempotent-Replayed: true`) instead of
+   * creating it now. Nothing was charged for the replay. Set by the client after
+   * construction, since it comes from a header rather than the body.
+   */
+  replayed = false;
   /** Raw response body, for forward-compatible access to new fields. */
   readonly raw: Record<string, unknown>;
 
@@ -380,6 +484,7 @@ export class Job {
     // still on `raw`.
     this.error = isJsonObject(d.error) ? (d.error as JobError) : null;
     this.pageResults = parsePageResults(d.pageResults);
+    this.callback = CallbackStatus.fromJson(d.callback);
     this.raw = data;
   }
 
@@ -400,5 +505,34 @@ export class Job {
 
   static fromJson(data: Record<string, unknown>): Job {
     return new Job(data);
+  }
+}
+
+/**
+ * One page of `listJobs`: API-submitted jobs, newest first.
+ *
+ * Each job in `data` has the same shape as `getJob` returns, minus `pageResults`.
+ * `nextCursor` is `null` on the last page; otherwise pass it back as `cursor`
+ * unchanged. For reconciliation, add up each job's `creditsUsed` (charged) and
+ * `creditsRefunded`.
+ */
+export class JobList {
+  readonly data: Job[];
+  readonly nextCursor: string | null;
+  readonly raw: Record<string, unknown>;
+
+  /**
+   * `nextCursor` that is missing or not a string reads as the last page: an
+   * unreadable cursor could not be passed back anyway, and stopping is the answer
+   * that cannot loop forever.
+   */
+  constructor(data: unknown) {
+    const d = requireFields(data, ["data"], "job list response");
+    if (!Array.isArray(d.data)) {
+      throw new MalformedResponseError("malformed job list response, data must be an array");
+    }
+    this.data = d.data.map((item: unknown) => Job.fromJson(item as Record<string, unknown>));
+    this.nextCursor = typeof d.nextCursor === "string" && d.nextCursor !== "" ? d.nextCursor : null;
+    this.raw = d;
   }
 }

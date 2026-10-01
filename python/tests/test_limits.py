@@ -38,7 +38,7 @@ def names(batches):
 # --------------------------------------------------------------------------- #
 # check_file_size — a property of the file, not of the request
 #
-# The per-file cap is STRICTER than the request cap (35MB vs 45MB), so a file can
+# The per-file cap is STRICTER than the request cap (35MB vs 90MB), so a file can
 # sit comfortably inside a request and still be rejected by the server every time.
 # --------------------------------------------------------------------------- #
 def test_a_file_exactly_on_the_per_file_cap_is_fine():
@@ -103,7 +103,7 @@ def test_empty_input_plans_nothing():
 
 def test_single_oversized_file_is_unbatchable():
     """No split can help a file the server rejects on its own. The planner applies
-    the per-file cap, so it stops at 35MB rather than waiting for 45MB."""
+    the per-file cap, so it stops at 35MB rather than waiting for 90MB."""
     with pytest.raises(InvalidFileError) as exc:
         plan_batches([img("huge.png", MAX_FILE_BYTES + 1)])
     assert exc.value.code == "INVALID_FILE"
@@ -118,23 +118,28 @@ def test_a_file_between_the_two_caps_is_refused_by_the_planner():
         plan_batches([img("doomed.pdf", between)])
 
 
+# Thirds, not halves: half the 80MB batch target is over the 35MB per-file cap.
 def test_batch_filled_exactly_to_the_target_stays_one_batch():
-    half = BATCH_TARGET_BYTES // 2
-    batches = plan_batches([img("a", half), img("b", BATCH_TARGET_BYTES - half)])
-    assert names(batches) == [["a", "b"]]
+    third = BATCH_TARGET_BYTES // 3
+    rest = BATCH_TARGET_BYTES - 2 * third
+    batches = plan_batches([img("a", third), img("b", third), img("c", rest)])
+    assert names(batches) == [["a", "b", "c"]]
 
 
 def test_one_byte_past_the_target_starts_a_second_batch():
-    half = BATCH_TARGET_BYTES // 2
-    batches = plan_batches([img("a", half), img("b", BATCH_TARGET_BYTES - half + 1)])
-    assert names(batches) == [["a"], ["b"]]
+    third = BATCH_TARGET_BYTES // 3
+    rest = BATCH_TARGET_BYTES - 2 * third
+    batches = plan_batches([img("a", third), img("b", third), img("c", rest + 1)])
+    assert names(batches) == [["a", "b"], ["c"]]
 
 
-def test_two_max_size_files_get_a_batch_each():
-    """The largest legal file is 35MB, so two of them blow the 40MB batch target
-    and must be split — neither is refused."""
-    batches = plan_batches([img("a", MAX_FILE_BYTES), img("b", MAX_FILE_BYTES)])
-    assert names(batches) == [["a"], ["b"]]
+def test_max_size_files_split_by_the_batch_target():
+    """The largest legal file is 35MB: two fit the 80MB batch target, a third
+    would blow it and must go to a new batch — none is refused."""
+    batches = plan_batches(
+        [img("a", MAX_FILE_BYTES), img("b", MAX_FILE_BYTES), img("c", MAX_FILE_BYTES)]
+    )
+    assert names(batches) == [["a", "b"], ["c"]]
 
 
 # --------------------------------------------------------------------------- #
@@ -176,7 +181,7 @@ def test_order_is_preserved_and_planning_is_deterministic():
 def test_format_bytes_does_not_round_small_overages_to_zero():
     """一个字节的超出不能被印成 0.0MB。
 
-    否则错误消息会变成「45.0MB 超过 45.0MB（超了 0.0MB）」——自相矛盾，
+    否则错误消息会变成「90.0MB 超过 90.0MB（超了 0.0MB）」——自相矛盾，
     读起来像是这道检查本身坏了。真实联调时就是这么显示的。
     """
     from image2ppt._limits import (

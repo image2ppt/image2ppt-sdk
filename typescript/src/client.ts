@@ -15,28 +15,37 @@ import { clearTimeout as clearTimer, setTimeout as setTimer } from "node:timers"
 import {
   APIConnectionError,
   APITimeoutError,
+  IdempotencyKeyInProgressError,
+  IdempotencyKeyMismatchError,
   Image2PPTError,
   Image2PPTTimeoutError,
   InvalidFileError,
+  InvalidIdempotencyKeyError,
+  InvalidParameterError,
   JobCancelledError,
   JobFailedError,
   MalformedResponseError,
   RateLimitedError,
+  ServerError,
   exceptionFor,
 } from "./errors.js";
 import { compressImageForUpload } from "./compress.js";
 import type { CompressedImage } from "./compress.js";
-import { checkFileSize, checkSubmission, planBatches } from "./limits.js";
+import { checkFileSize, checkPageSelection, checkSubmission, planBatches } from "./limits.js";
 import type { UploadItem } from "./limits.js";
+import { isBlank, normalizePages, parsePages } from "./pages.js";
 import type {
   Account,
   CancellationResult,
   ClientOptions,
+  ConvertAllOptions,
   ConvertOptions,
+  ListJobsOptions,
+  SubmitAllOptions,
   SubmitOptions,
   WaitOptions,
 } from "./types.js";
-import { Job, parseCancellationResult } from "./types.js";
+import { Job, JobList, parseCancellationResult, wholeNumber } from "./types.js";
 import { VERSION } from "./version.js";
 
 export const DEFAULT_BASE_URL = "https://image2ppt.com";
@@ -63,6 +72,101 @@ const RATE_LIMIT_FALLBACK_WAIT_MS = 5_000;
  * a retry a retry instead of a flood, and costs nothing when the server means it.
  */
 const MIN_RETRY_AFTER_SECONDS = 1;
+
+/**
+ * Waits before resending a submission whose outcome is unknown — a dropped
+ * connection, a timeout, a 5xx. One entry per extra attempt, so two retries.
+ *
+ * Resending is safe only because every attempt carries the same `Idempotency-Key`:
+ * if an earlier attempt did create the job, the service answers with that job
+ * instead of creating a second one. The count stays small because each attempt can
+ * re-upload up to 90MB.
+ */
+const SUBMIT_RETRY_DELAYS_MS = [1_000, 2_000];
+
+/**
+ * Bounds on waiting out `IDEMPOTENCY_KEY_IN_PROGRESS` — an earlier attempt with the
+ * same key that the service is still working on (typically one this client gave up
+ * on after its idle timeout). Bounded by attempts as well as time for the reason
+ * `MAX_BATCH_ATTEMPTS` gives: every attempt re-sends the whole body. The wait starts
+ * at `Retry-After` and grows by half each time, up to the cap.
+ */
+const IN_PROGRESS_MAX_ATTEMPTS = 10;
+const IN_PROGRESS_MAX_WAIT_MS = 180_000;
+const IN_PROGRESS_WAIT_CAP_MS = 30_000;
+
+/**
+ * Floor for the idle timeout of a submission by URL. The service may spend up to 120
+ * seconds downloading before it answers at all, and nothing moves on the connection
+ * meanwhile, so the client's usual 60 would give up on requests that are going fine.
+ */
+const URL_SUBMIT_MIN_TIMEOUT_MS = 180_000;
+
+/** Most links one submission by URL may carry. */
+const MAX_URLS = 50;
+
+/** What `Idempotency-Key` may contain: 1–255 printable ASCII characters. */
+const IDEMPOTENCY_KEY = /^[\x21-\x7e]{1,255}$/;
+
+/** The caller's key, checked, or a fresh random one when they gave none. */
+function resolveIdempotencyKey(key: unknown): string {
+  if (key === undefined || key === null) return randomUUID();
+  if (typeof key !== "string" || !IDEMPOTENCY_KEY.test(key)) {
+    throw new InvalidIdempotencyKeyError(
+      "idempotencyKey must be 1-255 printable ASCII characters (no spaces)",
+      { code: "INVALID_IDEMPOTENCY_KEY" },
+    );
+  }
+  return key;
+}
+
+/**
+ * `value` as an array of strings, refusing a bare string.
+ *
+ * A string is iterable, so `submit("deck.pdf")` from plain JavaScript would
+ * otherwise be read as one file per character.
+ */
+/** How long to wait before retrying a 429: `Retry-After`, else a fixed wait. */
+function rateLimitDelayMs(err: RateLimitedError): number {
+  return err.retryAfter != null ? err.retryAfter * 1000 : RATE_LIMIT_FALLBACK_WAIT_MS;
+}
+
+function stringList(value: unknown, name: string): string[] {
+  if (!Array.isArray(value)) {
+    throw new TypeError(`${name} must be an array of strings, not ${typeof value}`);
+  }
+  for (const item of value) {
+    if (typeof item !== "string") {
+      throw new TypeError(`${name} must hold strings, not ${typeof item}`);
+    }
+  }
+  return value as string[];
+}
+
+/**
+ * The optional fields both kinds of submission carry, leaving out unset ones.
+ *
+ * An empty or all-whitespace `pages` or `callbackUrl` means "not given" to the
+ * service, so it is not sent at all.
+ */
+function submissionFields(options: SubmitOptions): Record<string, string> {
+  const { callbackUrl } = options;
+  if (callbackUrl != null && typeof callbackUrl !== "string") {
+    throw new TypeError(`callbackUrl must be a string, not ${typeof callbackUrl}`);
+  }
+  const fields: Record<string, string> = {};
+  if (options.locale != null) fields.locale = options.locale;
+  if (options.aspectRatio != null) fields.aspectRatio = options.aspectRatio;
+  const selection = normalizePages(options.pages);
+  if (selection !== undefined) fields.pages = selection;
+  if (callbackUrl != null && !isBlank(callbackUrl)) fields.callbackUrl = callbackUrl;
+  return fields;
+}
+
+/** Whether a header value says `true`, ignoring case and surrounding space. */
+function headerIsTrue(value: string | null): boolean {
+  return (value ?? "").trim().toLowerCase() === "true";
+}
 
 /** How many images are read and re-encoded at the same time. See `#prepareFiles`. */
 const PREPARE_CONCURRENCY = 4;
@@ -186,7 +290,7 @@ class IdleWatchdog {
 
 function buildMultipart(
   files: PreparedFile[],
-  options: SubmitOptions,
+  formFields: Record<string, string>,
   onChunk: () => void,
 ): {
   body: RequestBody;
@@ -203,9 +307,7 @@ function buildMultipart(
     `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`;
   const trailer = `--${boundary}--\r\n`;
 
-  const fields: string[] = [];
-  if (options.locale) fields.push(field("locale", options.locale));
-  if (options.aspectRatio) fields.push(field("aspectRatio", options.aspectRatio));
+  const fields = Object.entries(formFields).map(([name, value]) => field(name, value));
 
   // The body streams, but its length is known before the first byte goes out: image
   // payloads are already in memory, a PDF's size was measured while preparing it, and
@@ -516,36 +618,112 @@ export class Image2PPTClient {
    * Submit a batch of files and create a conversion job.
    *
    * Checked locally before anything is uploaded: the files must add up to at most
-   * 45MB and at most 50 pages. Over either limit this throws without opening a
+   * 90MB and at most 50 pages (the pages *selected*, when `pages` is given), and
+   * `pages` must be spelled correctly. Over a limit this throws without opening a
    * connection — going over the size cap on the wire does not come back as a clean
    * error, it comes back as a dead connection.
    *
-   * **A failed submission is never retried automatically.** A network error does
-   * not tell you whether the request body made it: the job may not exist, or it
-   * may exist with credits already reserved and only the response lost. Retrying
-   * the second case charges twice, and without an idempotency key there is no way
-   * to tell them apart — so the error is thrown as-is. Check `account()` or your
-   * job list before resending.
+   * **Every submission carries an `Idempotency-Key`**, and that is what makes a
+   * failed one safe to resend: if an earlier attempt did create the job, the service
+   * hands that job back (`job.replayed` is true) instead of creating and charging for
+   * a second one. So this call resends by itself, always with the same key, when the
+   * outcome is unknown — a dropped connection, an idle timeout, or a 5xx (up to 2
+   * more attempts, 1s and 2s apart) — and waits out `IDEMPOTENCY_KEY_IN_PROGRESS`, an
+   * earlier attempt the service is still working on (up to 10 attempts / 3 minutes).
+   * A 429 is not retried here; `submitAll` waits those out.
+   *
+   * If it still fails, the key is on the error as `err.idempotencyKey`. Calling
+   * `submit` again with that key and the same files and options is safe for 24
+   * hours; calling it without the key may create a second job.
    *
    * @param paths Local file paths (one or more). png/jpeg/webp/gif/pdf, each ≤ 35MB,
-   *   and ≤ 45MB of file content per request. An image is 1 page, a PDF is its page
+   *   and ≤ 90MB of file content per request. An image is 1 page, a PDF is its page
    *   count; the total must be ≤ 50 pages. For more files than one request can hold,
    *   use `submitAll` / `convertAll`.
-   * @returns A `Job` with status `pending`, plus `slideCount` and `creditsReserved`.
+   * @returns A `Job` with status `pending` (for a replay: the job's current status),
+   *   plus `slideCount` and `creditsReserved`.
    * @throws InvalidFileError Including the local `PAYLOAD_TOO_LARGE` pre-flight failure.
+   * @throws InvalidPagesError / PagesOutOfRangeError / TooManySlidesError A selection
+   *   that is certain to be refused, before anything is sent.
+   * @throws IdempotencyKeyMismatchError The key was used for a different request.
+   * @throws APIConnectionError / ServerError / IdempotencyKeyInProgressError Once the
+   *   retries above run out.
    */
   async submit(paths: string[], options: SubmitOptions = {}): Promise<Job> {
-    if (!paths.length) {
+    const list = stringList(paths, "paths");
+    if (!list.length) {
       throw new Error("at least one file is required");
     }
-    return this.#submitPrepared(await this.#prepareFiles(paths), options);
+    const key = resolveIdempotencyKey(options.idempotencyKey);
+    const fields = submissionFields(options);
+    // The spelling needs no files: refuse a typo before compressing anything. Range
+    // and count wait for the page total, so the error is the one the service would
+    // give.
+    if (fields.pages !== undefined) parsePages(fields.pages);
+    const files = await this.#prepareFiles(list);
+    checkPrepared(files, fields.pages);
+    return this.#submitWithKey(() => this.#postFiles(files, fields, key), key);
+  }
+
+  /**
+   * Create a conversion job from files the service downloads itself.
+   *
+   * Instead of uploading, hand over `https` links; the service fetches them in order
+   * and converts them as one deck. The downloaded files are held to the same limits
+   * as uploads (35MB each, 90MB together, 50 pages). File types are judged by
+   * content, not by the link or its `Content-Type`.
+   *
+   * Downloading takes time — up to 60 seconds a link and 120 for the request — so
+   * this call waits at least 180 seconds for an answer, whatever the client's
+   * `timeoutMs`. Retries and `idempotencyKey` work exactly as in `submit`. Only one
+   * submission by URL per account can be in flight at a time; another gets a
+   * `RateLimitedError`.
+   *
+   * @param urls 1–50 `https` links. Each must resolve to a public address.
+   * @param options As `submit`. With links the page total is not known here, so
+   *   `pages` is only checked for spelling and for selecting more than 50 pages.
+   * @throws InvalidUrlError A link was refused before downloading.
+   * @throws UrlFetchFailedError A download failed; may be temporary. For these two —
+   *   and `InvalidFileError` about a downloaded file — `err.index` says which link,
+   *   counting from 0.
+   * @throws InvalidParameterError More than 50 links, thrown locally.
+   */
+  async submitUrls(urls: string[], options: SubmitOptions = {}): Promise<Job> {
+    const list = stringList(urls, "urls");
+    if (!list.length) {
+      throw new Error("at least one URL is required");
+    }
+    if (list.length > MAX_URLS) {
+      throw new InvalidParameterError(
+        `${list.length} URLs in one submission, over the ${MAX_URLS} allowed`,
+        { code: "INVALID_PARAMETER" },
+      );
+    }
+    const key = resolveIdempotencyKey(options.idempotencyKey);
+    const fields = submissionFields(options);
+    checkPageSelection(fields.pages);
+    const body = Buffer.from(JSON.stringify({ urls: list, ...fields }), "utf8");
+    return this.#submitWithKey(
+      () =>
+        this.#request("POST", "/api/v1/jobs", {
+          body: () => ({
+            body,
+            contentType: "application/json",
+            contentLength: body.byteLength,
+          }),
+          headers: { "Idempotency-Key": key },
+          timeoutMs: Math.max(this.timeoutMs, URL_SUBMIT_MIN_TIMEOUT_MS),
+          consume: (res) => this.#parseSubmission(res),
+        }),
+      key,
+    );
   }
 
   /**
    * Split files into submittable batches and create **one job per batch**.
    *
    * For a pile of files too big or too numerous for a single request. Batching
-   * rules live in `planBatches`: at most 40MB of file content and at most 50
+   * rules live in `planBatches`: at most 80MB of file content and at most 50
    * images per batch, and every PDF in a batch of its own (the SDK does not parse
    * PDFs, so only the server knows their page count). Input order is preserved.
    *
@@ -560,8 +738,11 @@ export class Image2PPTClient {
    * the same batch again. Waiting is the normal path here. Total waiting is capped
    * by the client's `rateLimitMaxWaitMs`.
    *
-   * **Network errors are not retried** — see `submit`. Only a 429 is, because only
-   * a 429 proves the server did not take the submission.
+   * **Each batch is its own submission with its own `Idempotency-Key`**, and is
+   * retried exactly as `submit` retries — plus the 429s above, with the same key.
+   * There is no `pages` or `idempotencyKey` option here: page numbers run across one
+   * submission and a key names one job, so neither can span several batches. Submit
+   * batches yourself with `submit` if you need them.
    *
    * **If it does give up, the jobs already created are handed back on the error**,
    * in `err.submittedJobs`. Those jobs are running on the server with credits
@@ -573,11 +754,13 @@ export class Image2PPTClient {
    *   batching can carry it.
    * @throws RateLimitedError Still rate limited after `rateLimitMaxWaitMs`.
    */
-  async submitAll(paths: string[], options: SubmitOptions = {}): Promise<Job[]> {
-    if (!paths.length) {
+  async submitAll(paths: string[], options: SubmitAllOptions = {}): Promise<Job[]> {
+    const list = stringList(paths, "paths");
+    if (!list.length) {
       throw new Error("at least one file is required");
     }
-    const files = await this.#prepareFiles(paths);
+    const fields = batchFields(options);
+    const files = await this.#prepareFiles(list);
     const batches = planBatches(
       files.map((file): PreparedUploadItem => ({
         path: file.path,
@@ -593,7 +776,7 @@ export class Image2PPTClient {
         jobs.push(
           await this.#submitBatch(
             batch.map((item) => (item as PreparedUploadItem).file),
-            options,
+            fields,
             budget,
           ),
         );
@@ -777,7 +960,7 @@ export class Image2PPTClient {
   /**
    * One-shot: submit → wait for completion → download to `destPath`.
    *
-   * One job, one PPTX — the files must fit in a single submission (45MB of file
+   * One job, one PPTX — the files must fit in a single submission (90MB of file
    * content, 50 pages). For more than that, `convertAll` splits the pile and writes
    * one PPTX per batch.
    */
@@ -786,10 +969,25 @@ export class Image2PPTClient {
     destPath: string,
     options: ConvertOptions = {},
   ): Promise<Job> {
-    const job = await this.submit(paths, options);
-    const completed = await this.wait(job.jobId, options);
-    await this.download(completed.jobId, destPath);
-    return completed;
+    // Resolved here, not in submit: a wait or download that fails after the job
+    // exists must hand back the key too, or retrying convert() would create and pay
+    // for a second job.
+    const idempotencyKey = resolveIdempotencyKey(options.idempotencyKey);
+    const job = await this.submit(paths, { ...options, idempotencyKey });
+    try {
+      const completed = await this.wait(job.jobId, options);
+      await this.download(completed.jobId, destPath);
+      return completed;
+    } catch (err) {
+      if (typeof err === "object" && err !== null) {
+        try {
+          (err as { idempotencyKey?: string }).idempotencyKey = idempotencyKey;
+        } catch {
+          // a frozen error object: keep it as it is rather than replace it
+        }
+      }
+      throw err;
+    }
   }
 
   /**
@@ -819,8 +1017,11 @@ export class Image2PPTClient {
   async convertAll(
     paths: string[],
     destDir: string,
-    options: ConvertOptions = {},
+    options: ConvertAllOptions = {},
   ): Promise<string[]> {
+    // Refused before the destination is even created: a plain-JS caller passing
+    // `pages` or `idempotencyKey` gets the answer before anything touches the disk.
+    batchFields(options);
     // Before anything is submitted: if the destination is unusable, fail now
     // rather than after N jobs exist with credits reserved and nowhere to put
     // their output. This is the one step that can fail for free.
@@ -845,6 +1046,57 @@ export class Image2PPTClient {
     return written;
   }
 
+  /**
+   * One page of the jobs this account submitted through the API, newest first.
+   *
+   * Jobs deleted on the website are not listed. Each job has `getJob`'s shape minus
+   * `pageResults`; for reconciliation, add up `creditsUsed` and `creditsRefunded`.
+   * To walk every page, use `iterJobs`.
+   *
+   * @throws InvalidParameterError A parameter is invalid; `message` says which.
+   */
+  async listJobs(options: ListJobsOptions = {}): Promise<JobList> {
+    const params = new URLSearchParams();
+    for (const [name, value] of [
+      ["createdFrom", options.createdFrom],
+      ["createdTo", options.createdTo],
+      ["limit", options.limit],
+      ["cursor", options.cursor],
+    ] as const) {
+      // null/undefined and "" all mean "not given"; everything else goes as given,
+      // so the service is the one to judge it — `limit: 0` included.
+      if (value != null && value !== "") params.set(name, String(value));
+    }
+    const query = params.toString();
+    return new JobList(
+      await this.#request("GET", `/api/v1/jobs${query ? `?${query}` : ""}`, {
+        consume: (res) => this.#parseJson(res),
+      }),
+    );
+  }
+
+  /**
+   * Every job `listJobs` would list, following `nextCursor` to the end.
+   *
+   * `limit` is the page size, not a cap on how many jobs come back. A 429 is waited
+   * out (`Retry-After`, else 5s), and a page that fails in a way worth repeating
+   * (`isTransient`) is fetched again after a short backoff — at most 10 attempts per
+   * page before the error is thrown.
+   *
+   * ```ts
+   * for await (const job of client.iterJobs({ createdFrom: "2026-10-01" })) { ... }
+   * ```
+   */
+  async *iterJobs(options: Omit<ListJobsOptions, "cursor"> = {}): AsyncGenerator<Job> {
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await this.#listPageWithRetries({ ...options, cursor });
+      yield* page.data;
+      if (page.nextCursor === null) return;
+      cursor = page.nextCursor;
+    }
+  }
+
   /** Return account info: `{ email, credits }` (available credits). */
   async account(): Promise<Account> {
     return (await this.#request("GET", "/api/v1/account", {
@@ -854,21 +1106,25 @@ export class Image2PPTClient {
 
   // ----- internals --------------------------------------------------- //
   /**
-   * Submit one batch, waiting out rate limits until `deadline`.
+   * Submit one batch, waiting out rate limits while `budget` allows.
    *
-   * Retrying a 429 is not the same gamble as retrying a broken upload: a 429 is
-   * the server saying it did *not* take the submission. Nothing was created and
-   * nothing was charged, so trying the same batch again is free.
+   * The batch was prepared (images compressed) once, in `submitAll`, and gets its
+   * `Idempotency-Key` once, here, before the loop — so every attempt sends the very
+   * same request under the same key, which is what lets the service recognise a
+   * resend.
    *
-   * Both flavors of 429 (per-minute page quota, concurrent-job cap) carry a
-   * `Retry-After` and are handled identically. When the header is missing we fall
-   * back to a fixed wait.
+   * A 429 is the server saying it did *not* take the submission — nothing was
+   * created and nothing charged — so trying the same batch again is free. Both
+   * flavors (per-minute page quota, concurrent-job cap) carry a `Retry-After` and are
+   * handled identically; when the header is missing we fall back to a fixed wait.
+   * Other failures are retried inside `#submitWithKey`.
    */
   async #submitBatch(
     files: PreparedFile[],
-    options: SubmitOptions,
+    fields: Record<string, string>,
     budget: WaitBudget,
   ): Promise<Job> {
+    const key = resolveIdempotencyKey(undefined);
     // Two things stop this: the shared waiting `budget`, and MAX_BATCH_ATTEMPTS. The
     // budget bounds time spent waiting; the attempt count bounds the uploads, which
     // the budget cannot see — a server answering `Retry-After: 1` forever costs almost
@@ -876,15 +1132,104 @@ export class Image2PPTClient {
     let attemptsLeft = MAX_BATCH_ATTEMPTS;
     for (;;) {
       try {
-        return await this.#submitPrepared(files, options);
+        return await this.#submitWithKey(() => this.#postFiles(files, fields, key), key);
       } catch (err) {
         if (!(err instanceof RateLimitedError)) throw err;
         attemptsLeft -= 1;
-        const delay =
-          err.retryAfter != null ? err.retryAfter * 1000 : RATE_LIMIT_FALLBACK_WAIT_MS;
         // On the last attempt, do not wait first: nothing follows the wait, so it
         // would only delay the error the caller is already getting.
-        if (attemptsLeft <= 0 || !(await budget.spend(delay))) throw err;
+        if (attemptsLeft <= 0 || !(await budget.spend(rateLimitDelayMs(err)))) throw err;
+      }
+    }
+  }
+
+  /**
+   * Send one submission until its outcome is known; see `submit` for the rules.
+   *
+   * `send` makes one attempt and must send the identical request every time, under
+   * `key`. Whatever finally escapes carries `key` as `idempotencyKey`, so the caller
+   * can resend safely.
+   *
+   * A 429 is left to the caller on purpose. By the contract, resending the same
+   * request under a key whose job exists is answered with that job (and one still
+   * being processed with "in progress"), so a 429 here still means nothing was taken.
+   */
+  async #submitWithKey(send: () => Promise<Job>, key: string): Promise<Job> {
+    let retriesUsed = 0;
+    let inProgressAttempts = 0;
+    const inProgressBudget = new WaitBudget(IN_PROGRESS_MAX_WAIT_MS);
+    try {
+      for (let attempt = 1; ; attempt += 1) {
+        try {
+          return await send();
+        } catch (err) {
+          if (err instanceof IdempotencyKeyInProgressError) {
+            inProgressAttempts += 1;
+            const firstMs = (err.retryAfter ?? 2) * 1000;
+            const delay = Math.min(
+              firstMs * 1.5 ** (inProgressAttempts - 1),
+              IN_PROGRESS_WAIT_CAP_MS,
+            );
+            if (
+              inProgressAttempts >= IN_PROGRESS_MAX_ATTEMPTS ||
+              !(await inProgressBudget.spend(delay))
+            ) {
+              throw err;
+            }
+            continue;
+          }
+          if (err instanceof APIConnectionError || err instanceof ServerError) {
+            const delay = SUBMIT_RETRY_DELAYS_MS[retriesUsed];
+            if (delay === undefined) throw err;
+            retriesUsed += 1;
+            await sleep(delay);
+            continue;
+          }
+          if (err instanceof IdempotencyKeyMismatchError && attempt > 1) {
+            // Only a request that created a job holds its key, so an earlier attempt
+            // of this very call did — and the files changed on disk in between, or
+            // this would have been a replay.
+            err.message +=
+              "; an earlier attempt of this call did create a job with this key before " +
+              "the request changed (did a file change on disk?) — find it with listJobs()";
+          }
+          throw err;
+        }
+      }
+    } catch (err) {
+      // Not only SDK errors: a PDF that vanished between attempts fails with a
+      // filesystem error, and the first attempt may already have created the job.
+      if (typeof err === "object" && err !== null) {
+        try {
+          (err as { idempotencyKey?: string }).idempotencyKey = key;
+        } catch {
+          // a frozen error object: keep it as it is rather than replace it
+        }
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * One `listJobs` page for `iterJobs`, retried while that is worth it.
+   *
+   * Listing is a read, so repeating it is free: a 429 waits `Retry-After` and anything
+   * `isTransient` backs off, both within `MAX_BATCH_ATTEMPTS`.
+   */
+  async #listPageWithRetries(options: ListJobsOptions): Promise<JobList> {
+    let backoff = 1_000;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await this.listJobs(options);
+      } catch (err) {
+        if (attempt >= MAX_BATCH_ATTEMPTS) throw err;
+        if (!(err instanceof Image2PPTError) || !err.isTransient) throw err;
+        if (err instanceof RateLimitedError) {
+          await sleep(rateLimitDelayMs(err));
+        } else {
+          await sleep(backoff);
+          backoff = Math.min(backoff * 2, 15_000);
+        }
       }
     }
   }
@@ -962,23 +1307,31 @@ export class Image2PPTClient {
     };
   }
 
-  /** Validate and submit a prepared payload exactly once. */
-  async #submitPrepared(files: PreparedFile[], options: SubmitOptions): Promise<Job> {
-    // Pre-flight happens after image preparation because these are the exact bytes
-    // that will be transmitted, not the potentially much larger source files.
-    for (const file of files) checkFileSize(file.path, file.size);
-    checkSubmission(
-      files.reduce((total, file) => total + file.size, 0),
-      files.filter((file) => file.isImage).length,
-      files.filter((file) => !file.isImage).length,
-    );
-    return Job.fromJson(
-      await this.#request("POST", "/api/v1/jobs", {
-        // Rebuilt per attempt: a retry needs a body that has not been consumed.
-        body: (watchdog) => buildMultipart(files, options, () => watchdog.kick()),
-        consume: (res) => this.#parseJson(res),
-      }),
-    );
+  /**
+   * POST the multipart submission once, under `key`.
+   *
+   * PDFs are reopened and streamed from disk on every attempt; images go from the
+   * bytes compressed once in `#prepareFile`, so a resend carries the same image bytes
+   * as the first attempt.
+   */
+  async #postFiles(
+    files: PreparedFile[],
+    fields: Record<string, string>,
+    key: string,
+  ): Promise<Job> {
+    return this.#request("POST", "/api/v1/jobs", {
+      // Rebuilt per attempt: a retry needs a body that has not been consumed.
+      body: (watchdog) => buildMultipart(files, fields, () => watchdog.kick()),
+      headers: { "Idempotency-Key": key },
+      consume: (res) => this.#parseSubmission(res),
+    });
+  }
+
+  /** A submission's answer: the job, marked when the service replayed it. */
+  async #parseSubmission(res: Response): Promise<Job> {
+    const job = Job.fromJson(await this.#parseJson(res));
+    job.replayed = headerIsTrue(res.headers.get("Idempotent-Replayed"));
+    return job;
   }
 
   /**
@@ -1019,11 +1372,16 @@ export class Image2PPTClient {
         contentLength: number;
       };
       consume: (res: Response, watchdog: IdleWatchdog) => Promise<T>;
+      /** Extra request headers, e.g. `Idempotency-Key`. */
+      headers?: Record<string, string>;
+      /** Idle timeout for this request, when it must differ from the client's. */
+      timeoutMs?: number;
     },
   ): Promise<T> {
+    const timeoutMs = options.timeoutMs ?? this.timeoutMs;
     const watchdog = new IdleWatchdog(
-      this.timeoutMs,
-      `request to ${path} went ${this.timeoutMs}ms with no data moving ` +
+      timeoutMs,
+      `request to ${path} went ${timeoutMs}ms with no data moving ` +
         "(timeoutMs is an idle timeout, not a limit on how long a transfer may take)",
     );
     try {
@@ -1036,6 +1394,7 @@ export class Image2PPTClient {
             Authorization: `Bearer ${this.#apiKey}`,
             "User-Agent": USER_AGENT,
             ...(this.acceptLanguage ? { "Accept-Language": this.acceptLanguage } : {}),
+            ...options.headers,
             ...(payload
               ? {
                   "Content-Type": payload.contentType,
@@ -1182,11 +1541,19 @@ export class Image2PPTClient {
   async #raiseForError(res: Response): Promise<never> {
     let code: string | undefined;
     let message: string | undefined;
+    let index: number | undefined;
     try {
-      const body = (await res.json()) as { error?: { code?: string; message?: string } };
+      const body = (await res.json()) as {
+        error?: { code?: string; message?: string; index?: unknown };
+      };
       if (body && typeof body === "object" && body.error) {
         code = body.error.code;
         message = body.error.message;
+        // A whole, non-negative number only: `3.0` is 3, `"1"`, `true`, `-1` and
+        // `1.5` are no index at all — the same reading as the Python client.
+        const raw = body.error.index;
+        const whole = wholeNumber(raw);
+        if (whole !== null && whole >= 0) index = whole;
       }
     } catch (err) {
       // The watchdog's abort comes through here when the error body stalls partway.
@@ -1204,6 +1571,7 @@ export class Image2PPTClient {
       code,
       message: message ?? `request failed (HTTP ${res.status})`,
       retryAfter: parseRetryAfter(res.headers.get("Retry-After")),
+      index,
     });
   }
 
@@ -1221,6 +1589,43 @@ export class Image2PPTClient {
     }
     await sleep(Math.min(ms, remaining, MAX_SLEEP_MS));
   }
+}
+
+/**
+ * Pre-flight, before a single byte goes out: an oversized request is not answered
+ * with an error, it is cut off — so it must never be sent.
+ */
+function checkPrepared(files: PreparedFile[], pages: string | undefined): void {
+  // After image preparation, because these are the exact bytes that will be
+  // transmitted, not the potentially much larger source files.
+  for (const file of files) checkFileSize(file.path, file.size);
+  checkSubmission(
+    files.reduce((total, file) => total + file.size, 0),
+    files.filter((file) => file.isImage).length,
+    // A PDF's real page count is only known server-side; counting it as at least 1
+    // is what stops "50 images + a PDF" from being sent as a submission that is
+    // certain to come back over the page limit.
+    files.filter((file) => !file.isImage).length,
+    pages,
+  );
+}
+
+/**
+ * The fields for `submitAll` / `convertAll`, refusing the two options that cannot
+ * span several batches. The types already leave them out; this is for plain
+ * JavaScript, where a silently ignored `pages` would convert pages nobody asked for.
+ */
+function batchFields(options: SubmitAllOptions): Record<string, string> {
+  const extra = options as SubmitOptions;
+  for (const name of ["pages", "idempotencyKey"] as const) {
+    if (extra[name] !== undefined) {
+      throw new TypeError(
+        `${name} is not supported by submitAll / convertAll: it cannot span several ` +
+          "batches. Use submit() for one submission",
+      );
+    }
+  }
+  return submissionFields(options);
 }
 
 /** Pull the URL out of a `Link: <url>; rel=...` header, or null. */

@@ -20,11 +20,18 @@ export {
   APIConnectionError,
   APITimeoutError,
   AuthenticationError,
+  IdempotencyKeyInProgressError,
+  IdempotencyKeyMismatchError,
   Image2PPTError,
   Image2PPTTimeoutError,
   InsufficientCreditsError,
   InvalidAspectRatioError,
+  InvalidCallbackUrlError,
   InvalidFileError,
+  InvalidIdempotencyKeyError,
+  InvalidPagesError,
+  InvalidParameterError,
+  InvalidUrlError,
   JobAlreadyFinishedError,
   JobCancelledError,
   JobFailedError,
@@ -35,10 +42,13 @@ export {
   NotReadyError,
   OutputExpiredError,
   PageRateExceededError,
+  PagesOutOfRangeError,
   RateLimitedError,
   ServerError,
   TooManySlidesError,
   UploadAbortedError,
+  UrlFetchFailedError,
+  WebhookVerificationError,
 } from "./errors.js";
 export type { ErrorInit } from "./errors.js";
 export {
@@ -47,21 +57,27 @@ export {
   MAX_PAGES_PER_JOB,
   MAX_UPLOAD_BYTES,
   checkFileSize,
+  checkPageSelection,
   checkSubmission,
   planBatches,
 } from "./limits.js";
 export type { UploadItem } from "./limits.js";
-export { Job, PageError, PageResult } from "./types.js";
+export { CallbackStatus, Job, JobList, PageError, PageResult } from "./types.js";
+export { WebhookEvent, verifyWebhook } from "./webhook.js";
+export type { VerifyWebhookOptions, WebhookHeaders } from "./webhook.js";
 export type {
   Account,
   AspectRatio,
   CancellationResult,
   ClientOptions,
+  ConvertAllOptions,
   ConvertOptions,
   JobError,
+  ListJobsOptions,
   JobStatus,
   Locale,
   PageStatus,
+  SubmitAllOptions,
   SubmitOptions,
   WaitOptions,
 } from "./types.js";

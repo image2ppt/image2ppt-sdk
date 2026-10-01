@@ -1,7 +1,7 @@
 /**
  * Upload size limits and batch planning.
  *
- * The API caps the **file content of a single request** at 45MB. Going over that
+ * The API caps the **file content of a single request** at 90MB. Going over that
  * is not a friendly failure: the check can only run after the whole body has been
  * received, and the network layer in front of the API gives up on an oversized
  * request before it ever gets there — so a client that sends too much sees the
@@ -18,7 +18,8 @@
  * is how much `planBatches` puts in one batch, deliberately under the real one.
  */
 
-import { InvalidFileError, TooManySlidesError } from "./errors.js";
+import { InvalidFileError, PagesOutOfRangeError, TooManySlidesError } from "./errors.js";
+import { normalizePages, parsePages, selectedPageCount } from "./pages.js";
 
 /**
  * Server cap on **one** file. A file over this is rejected with `INVALID_FILE`
@@ -33,7 +34,7 @@ export const MAX_FILE_BYTES = 35 * 1024 * 1024;
  * (413 `PAYLOAD_TOO_LARGE`) — or, further up, cut off outright before the server can
  * answer at all. Keep in sync with the documented API contract.
  */
-export const MAX_UPLOAD_BYTES = 45 * 1024 * 1024;
+export const MAX_UPLOAD_BYTES = 90 * 1024 * 1024;
 
 /**
  * Byte budget for one auto-planned batch. **A splitting budget, not a cap** — the cap
@@ -47,7 +48,7 @@ export const MAX_UPLOAD_BYTES = 45 * 1024 * 1024;
  * count against the published limit, and a pre-flight that "leaves room" for framing
  * just makes the documented maximum unreachable.
  */
-export const BATCH_TARGET_BYTES = 40 * 1024 * 1024;
+export const BATCH_TARGET_BYTES = 80 * 1024 * 1024;
 
 /**
  * Server cap on pages per job. An image is 1 page; a PDF counts as its own page
@@ -73,7 +74,7 @@ export interface UploadItem {
 /** Format a byte count as MB, for human-readable error messages. */
 export function formatBytes(size: number): string {
   // Stays honest below a megabyte. Rounding everything to MB makes a submission one
-  // byte over the cap read as "45.0MB, over the 45.0MB limit (0.0MB too much)" — a
+  // byte over the cap read as "90.0MB, over the 90.0MB limit (0.0MB too much)" — a
   // message that contradicts itself and looks like the check is broken.
   if (size < 1024) return `${size}B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)}KB`;
@@ -84,7 +85,7 @@ export function formatBytes(size: number): string {
  * Throw if one file is over the per-file cap, whatever else it travels with.
  *
  * Separate from `checkSubmission` because it is a property of the file, not of
- * the request: a 40MB PDF fits under the 45MB request cap and would sail through
+ * the request: a 40MB PDF fits under the 90MB request cap and would sail through
  * batch planning, then be rejected by the server every single time. Fail on it
  * locally instead of building a batch that can never succeed.
  *
@@ -120,8 +121,12 @@ export function checkFileSize(path: string, size: number): void {
  * @param imagePages Number of image files. Each is exactly 1 page.
  * @param pdfFiles Number of PDFs (or other files whose page count is unknown to
  *   the client). Each counts as at least 1 page.
- * @throws TooManySlidesError The minimum page count already exceeds what one job
- *   can hold.
+ * @param pages The `pages` selection, if any. **With a selection, the page limit
+ *   applies to the pages selected, not to the files** — 60 images with
+ *   `pages: "1-10"` is a 10-page job, and a PDF may itself run past 50 pages. See
+ *   `checkPageSelection`.
+ * @throws TooManySlidesError The page count already exceeds what one job can hold.
+ * @throws InvalidPagesError / PagesOutOfRangeError See `checkPageSelection`.
  * @throws InvalidFileError File content over the per-request cap
  *   (`code = "PAYLOAD_TOO_LARGE"`).
  */
@@ -129,9 +134,14 @@ export function checkSubmission(
   totalBytes: number,
   imagePages: number,
   pdfFiles = 0,
+  pages?: string | null,
 ): void {
   const minPages = imagePages + pdfFiles;
-  if (minPages > MAX_PAGES_PER_JOB) {
+  if (normalizePages(pages) !== undefined) {
+    // Without PDFs every page is an image and the total is exact; with any, it is
+    // only known server-side.
+    checkPageSelection(pages, pdfFiles ? undefined : imagePages);
+  } else if (minPages > MAX_PAGES_PER_JOB) {
     const counted = pdfFiles
       ? `${imagePages} images plus ${pdfFiles} ${pdfFiles === 1 ? "PDF" : "PDFs"} ` +
         `(at least 1 page each) is at least ${minPages} pages`
@@ -142,6 +152,44 @@ export function checkSubmission(
       { code: "TOO_MANY_SLIDES" },
     );
   }
+  checkBytes(totalBytes);
+}
+
+/**
+ * Throw if a `pages` selection is certain to be refused.
+ *
+ * Only what is certain: the spelling, page 0, a page past `totalPages` when the total
+ * is known (`undefined` when it is not — a PDF, or files behind `urls`), and more than
+ * `MAX_PAGES_PER_JOB` distinct pages selected. That last one fails whatever the files
+ * hold: either the pages exist and there are too many, or they do not. A blank or
+ * absent selection selects nothing and passes.
+ *
+ * @throws InvalidPagesError The spelling is wrong (`INVALID_PAGES`).
+ * @throws PagesOutOfRangeError Page 0, or past the known total (`PAGES_OUT_OF_RANGE`).
+ * @throws TooManySlidesError More than `MAX_PAGES_PER_JOB` pages selected.
+ */
+export function checkPageSelection(pages: string | null | undefined, totalPages?: number): void {
+  const selection = normalizePages(pages);
+  if (selection === undefined) return;
+  const ranges = parsePages(selection);
+  if (totalPages !== undefined && Math.max(...ranges.map(([, end]) => end)) > totalPages) {
+    throw new PagesOutOfRangeError(
+      `pages ${JSON.stringify(selection)} goes past the end of the submission, which has ` +
+        `${totalPages} ${totalPages === 1 ? "page" : "pages"}`,
+      { code: "PAGES_OUT_OF_RANGE" },
+    );
+  }
+  const selected = selectedPageCount(ranges);
+  if (selected > MAX_PAGES_PER_JOB) {
+    throw new TooManySlidesError(
+      `pages ${JSON.stringify(selection)} selects ${selected} pages, over the ` +
+        `${MAX_PAGES_PER_JOB}-page-per-job limit`,
+      { code: "TOO_MANY_SLIDES" },
+    );
+  }
+}
+
+function checkBytes(totalBytes: number): void {
   if (totalBytes > MAX_UPLOAD_BYTES) {
     throw new InvalidFileError(
       `these files add up to ${formatBytes(totalBytes)}, over the ` +

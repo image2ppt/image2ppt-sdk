@@ -1,6 +1,6 @@
 """Upload size limits and batch planning.
 
-The API caps the **file content of a single request** at 45MB. Going over that
+The API caps the **file content of a single request** at 90MB. Going over that
 is not a friendly failure: the check can only run after the whole body has been
 received, and the network layer in front of the API gives up on an oversized
 request before it ever gets there — so a client that sends too much sees the
@@ -20,9 +20,10 @@ it is how much ``plan_batches`` puts in one batch, deliberately under the real o
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
-from .errors import InvalidFileError, TooManySlidesError
+from ._pages import normalize_pages, parse_pages, selected_page_count
+from .errors import InvalidFileError, PagesOutOfRangeError, TooManySlidesError
 
 #: Server cap on **one** file. A file over this is rejected with
 #: ``INVALID_FILE`` however it is submitted, so no amount of batching helps.
@@ -33,7 +34,7 @@ MAX_FILE_BYTES = 35 * 1024 * 1024
 #: and filenames do not count towards it. Over this, the request is rejected
 #: (413 ``PAYLOAD_TOO_LARGE``) — or, further up, cut off outright before the server
 #: can answer at all. Keep in sync with the documented API contract.
-MAX_UPLOAD_BYTES = 45 * 1024 * 1024
+MAX_UPLOAD_BYTES = 90 * 1024 * 1024
 
 #: Byte budget for one auto-planned batch. **A splitting budget, not a cap** — the cap
 #: is ``MAX_UPLOAD_BYTES``, and ``check_submission`` compares against that exactly.
@@ -45,7 +46,7 @@ MAX_UPLOAD_BYTES = 45 * 1024 * 1024
 #: ``MAX_UPLOAD_BYTES`` is file content only; the multipart framing around it does not
 #: count against the published limit, and a pre-flight that "leaves room" for framing
 #: just makes the documented maximum unreachable.
-BATCH_TARGET_BYTES = 40 * 1024 * 1024
+BATCH_TARGET_BYTES = 80 * 1024 * 1024
 
 #: Server cap on pages per job. An image is 1 page; a PDF counts as its own page
 #: count. Keep in sync with the documented API contract.
@@ -72,7 +73,7 @@ def format_bytes(size: int) -> str:
     """Format a byte count for human-readable error messages.
 
     Stays honest below a megabyte. Rounding everything to MB makes a submission one
-    byte over the cap read as "45.0MB, over the 45.0MB limit (0.0MB too much)" — a
+    byte over the cap read as "90.0MB, over the 90.0MB limit (0.0MB too much)" — a
     message that contradicts itself and looks like the check is broken.
     """
     if size < 1024:
@@ -86,7 +87,7 @@ def check_file_size(path: str, size: int) -> None:
     """Raise if one file is over the per-file cap, whatever else it travels with.
 
     Separate from ``check_submission`` because it is a property of the file, not
-    of the request: a 40MB PDF fits under the 45MB request cap and would sail
+    of the request: a 40MB PDF fits under the 90MB request cap and would sail
     through batch planning, then be rejected by the server every single time. Fail
     on it locally instead of building a batch that can never succeed.
 
@@ -107,7 +108,12 @@ def check_file_size(path: str, size: int) -> None:
         )
 
 
-def check_submission(total_bytes: int, image_pages: int, pdf_files: int = 0) -> None:
+def check_submission(
+    total_bytes: int,
+    image_pages: int,
+    pdf_files: int = 0,
+    pages: Optional[str] = None,
+) -> None:
     """Raise if a submission cannot succeed, before any bytes go on the wire.
 
     **The page check is a lower bound, not the server's verdict.** An image is
@@ -124,15 +130,23 @@ def check_submission(total_bytes: int, image_pages: int, pdf_files: int = 0) -> 
         image_pages: Number of image files. Each is exactly 1 page.
         pdf_files: Number of PDFs (or other files whose page count is unknown to
             the client). Each counts as at least 1 page.
+        pages: The ``pages`` selection, if any. **With a selection, the page limit
+            applies to the pages selected, not to the files** — 60 images with
+            ``pages="1-10"`` is a 10-page job, and a PDF may itself run past 50
+            pages. See ``check_page_selection``.
 
     Raises:
-        TooManySlidesError: The minimum page count already exceeds what one job
-            can hold.
+        TooManySlidesError: The page count already exceeds what one job can hold.
+        InvalidPagesError / PagesOutOfRangeError: see ``check_page_selection``.
         InvalidFileError: File content over the per-request cap
             (``code="PAYLOAD_TOO_LARGE"``).
     """
     min_pages = image_pages + pdf_files
-    if min_pages > MAX_PAGES_PER_JOB:
+    if normalize_pages(pages) is not None:
+        # Without PDFs every page is an image and the total is exact; with any, it
+        # is only known server-side.
+        check_page_selection(pages, total_pages=image_pages if not pdf_files else None)
+    elif min_pages > MAX_PAGES_PER_JOB:
         if pdf_files:
             counted = (
                 f"{image_pages} images plus {pdf_files} "
@@ -147,6 +161,43 @@ def check_submission(total_bytes: int, image_pages: int, pdf_files: int = 0) -> 
             "automatically",
             code="TOO_MANY_SLIDES",
         )
+    _check_bytes(total_bytes)
+
+
+def check_page_selection(pages: Optional[str], total_pages: Optional[int] = None) -> None:
+    """Raise if a ``pages`` selection is certain to be refused.
+
+    Only what is certain: the spelling, page 0, a page past ``total_pages`` when the
+    total is known (``None`` when it is not — a PDF, or files behind ``urls``), and
+    more than ``MAX_PAGES_PER_JOB`` distinct pages selected. That last one fails
+    whatever the files hold: either the pages exist and there are too many, or they
+    do not. A blank or ``None`` selection selects nothing and passes.
+
+    Raises:
+        InvalidPagesError: The spelling is wrong (``INVALID_PAGES``).
+        PagesOutOfRangeError: Page 0, or past the known total (``PAGES_OUT_OF_RANGE``).
+        TooManySlidesError: More than ``MAX_PAGES_PER_JOB`` pages selected.
+    """
+    pages = normalize_pages(pages)
+    if pages is None:
+        return
+    ranges = parse_pages(pages)
+    if total_pages is not None and max(end for _, end in ranges) > total_pages:
+        raise PagesOutOfRangeError(
+            f"pages {pages!r} goes past the end of the submission, which has "
+            f"{total_pages} {'page' if total_pages == 1 else 'pages'}",
+            code="PAGES_OUT_OF_RANGE",
+        )
+    selected = selected_page_count(ranges)
+    if selected > MAX_PAGES_PER_JOB:
+        raise TooManySlidesError(
+            f"pages {pages!r} selects {selected} pages, over the "
+            f"{MAX_PAGES_PER_JOB}-page-per-job limit",
+            code="TOO_MANY_SLIDES",
+        )
+
+
+def _check_bytes(total_bytes: int) -> None:
     if total_bytes > MAX_UPLOAD_BYTES:
         raise InvalidFileError(
             f"these files add up to {format_bytes(total_bytes)}, over the "

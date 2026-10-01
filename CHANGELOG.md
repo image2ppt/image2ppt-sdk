@@ -3,6 +3,59 @@
 All notable changes to the image2ppt SDKs (Python + TypeScript) are documented
 here. The two clients share a single version number.
 
+## 0.6.0
+
+Integration features for API 1.3.0: completion callbacks, safe resubmission,
+submission by URL, page selection, and a job list. Every new option is optional;
+code that does not use them sends exactly what it sent before, plus an
+`Idempotency-Key` header on each submission.
+
+### Added
+
+- **Both clients** — `callback_url` / `callbackUrl` on every submit call, and
+  `verify_webhook()` / `verifyWebhook()` to check a delivery's signature
+  ([Standard Webhooks](https://www.standardwebhooks.com): HMAC-SHA256 over
+  `id.timestamp.body`, a 300-second window, any matching `v1` signature passes).
+  Job snapshots gain `callback` — how delivery is going.
+- **Both clients** — `idempotency_key` / `idempotencyKey` on `submit`,
+  `submit_urls` and `convert`; a random UUID per call when not given. A replayed
+  job carries `replayed: true`.
+- **Both clients** — `submit_urls()` / `submitUrls()`: up to 50 `https` links the
+  service downloads itself.
+- **Both clients** — `pages` on `submit`, `submit_urls` and `convert`
+  (e.g. `"1-3, 7"`). Only the selected pages are charged and count towards the
+  50-page limit.
+- **Both clients** — `list_jobs()` / `listJobs()` for one page of the account's
+  API jobs, and `iter_jobs()` / `iterJobs()` to walk them all.
+- **Both clients** — an exception type for each new error code
+  (`InvalidPagesError`, `PagesOutOfRangeError`, `InvalidCallbackUrlError`,
+  `InvalidIdempotencyKeyError`, `IdempotencyKeyMismatchError`,
+  `IdempotencyKeyInProgressError`, `InvalidUrlError`, `UrlFetchFailedError`,
+  `InvalidParameterError`), and `index` on every error: which of `urls` it is
+  about.
+
+### Changed
+
+- **Both clients** — a submission whose outcome is unknown is now **resent
+  automatically**, always under the same `Idempotency-Key`: after a dropped
+  connection, a per-request timeout or a 5xx (up to 2 more attempts), and while an
+  earlier attempt is still in progress (up to 10 attempts / 3 minutes). Until now
+  such a failure was never retried, because nothing could tell "the job was
+  created and only the response was lost" apart from "nothing happened"; the key
+  makes the resend safe. An error that still escapes carries `idempotency_key` /
+  `idempotencyKey` — resending with it is safe for 24 hours.
+- **Both clients** — `submit_all` / `convert_all` (`submitAll` / `convertAll`)
+  accept `callback_url`. Each batch gets its own key, kept across its retries,
+  including the 429s these calls already waited out.
+- **Both clients** — with `pages`, the local page check counts the pages selected,
+  so a PDF longer than 50 pages is no longer refused. The spelling of `pages` is
+  checked locally, by the same rules the service uses.
+- **Both clients** — `page_number` / `pageNumber` in `page_results` is the page's
+  place in the delivered deck. Without `pages` that is the same as before; with
+  `pages` it is the k-th selected page.
+- **Both clients** — a single string where a list of paths or URLs is expected is
+  refused with a type error instead of being read one character at a time.
+
 ## 0.5.3
 
 ### Fixed

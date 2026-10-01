@@ -7,29 +7,42 @@ import os
 import re
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence
 from urllib.parse import quote
 
 import requests
 from PIL import Image, UnidentifiedImageError
 
 from ._compress import IMAGE_MIMES, compress_image_for_upload
-from ._limits import UploadItem, check_file_size, check_submission, plan_batches
+from ._limits import (
+    UploadItem,
+    check_file_size,
+    check_page_selection,
+    check_submission,
+    plan_batches,
+)
+from ._pages import is_blank, normalize_pages, parse_pages
 from .errors import (
     APIConnectionError,
     APITimeoutError,
+    IdempotencyKeyInProgressError,
+    IdempotencyKeyMismatchError,
     Image2PPTError,
     Image2PPTTimeoutError,
     InvalidFileError,
+    InvalidIdempotencyKeyError,
+    InvalidParameterError,
     JobCancelledError,
     JobFailedError,
     MalformedResponseError,
     RateLimitedError,
+    ServerError,
     exception_for,
 )
-from .models import CancellationResult, Job
+from .models import CancellationResult, Job, JobList, _is_whole_number
 from ._version import __version__
 
 DEFAULT_BASE_URL = "https://image2ppt.com"
@@ -88,6 +101,35 @@ _MAX_SLEEP = (2**31 - 1) / 1000
 #: of megabytes at a time. A server still refusing after this many tries is not going
 #: to be talked round by more of them.
 _MAX_BATCH_ATTEMPTS = 10
+
+#: Waits before resending a submission whose outcome is unknown — a dropped
+#: connection, a timeout, a 5xx. One entry per extra attempt, so two retries.
+#:
+#: Resending is safe only because every attempt carries the same ``Idempotency-Key``:
+#: if an earlier attempt did create the job, the service answers with that job
+#: instead of creating a second one. The count stays small because each attempt can
+#: re-upload up to 90MB.
+_SUBMIT_RETRY_DELAYS = (1.0, 2.0)
+
+#: Bounds on waiting out ``IDEMPOTENCY_KEY_IN_PROGRESS`` — an earlier attempt with
+#: the same key that the service is still working on (typically one this client gave
+#: up on after its per-request timeout). Bounded by attempts as well as time for the
+#: reason ``_MAX_BATCH_ATTEMPTS`` gives: every attempt re-sends the whole body. The
+#: wait starts at ``Retry-After`` and grows by half each time, up to the cap.
+_IN_PROGRESS_MAX_ATTEMPTS = 10
+_IN_PROGRESS_MAX_WAIT = 180.0
+_IN_PROGRESS_WAIT_CAP = 30.0
+
+#: Floor for the per-request timeout of a submission by URL. The service may spend
+#: up to 120 seconds downloading before it even starts creating the job, so the
+#: client's usual 60 would give up on requests that are going fine.
+_URL_SUBMIT_MIN_TIMEOUT = 180.0
+
+#: Most links one submission by URL may carry.
+_MAX_URLS = 50
+
+#: What ``Idempotency-Key`` may contain: 1–255 printable ASCII characters.
+_IDEMPOTENCY_KEY = re.compile(r"[\x21-\x7e]{1,255}")
 
 
 def _ensure_writable_dir(dest_dir: str) -> None:
@@ -212,6 +254,68 @@ def _response_header(headers: Any, name: str) -> Optional[str]:
     return None
 
 
+def _resolve_idempotency_key(key: Optional[str]) -> str:
+    """The caller's key, checked, or a fresh random one when they gave none."""
+    if key is None:
+        return str(uuid.uuid4())
+    if not isinstance(key, str) or not _IDEMPOTENCY_KEY.fullmatch(key):
+        raise InvalidIdempotencyKeyError(
+            "idempotency_key must be 1-255 printable ASCII characters (no spaces)",
+            code="INVALID_IDEMPOTENCY_KEY",
+        )
+    return key
+
+
+def _string_list(value: Any, name: str, *, paths: bool = False) -> List[str]:
+    """``value`` as a list of strings, refusing a bare string.
+
+    A string is itself a sequence, so ``submit("deck.pdf")`` would otherwise be read
+    as one file per character. With ``paths``, ``pathlib.Path`` and other path-like
+    entries are accepted and turned into strings, as they always were.
+    """
+    if isinstance(value, (str, bytes, os.PathLike)):
+        raise TypeError(f"{name} must be a list, not a single {type(value).__name__}")
+    items = []
+    for item in value:
+        if paths and isinstance(item, os.PathLike):
+            item = os.fspath(item)
+        if not isinstance(item, str):
+            raise TypeError(f"{name} must hold strings, not {type(item).__name__}")
+        items.append(item)
+    return items
+
+
+def _rate_limit_delay(exc: RateLimitedError) -> float:
+    """How long to wait before retrying a 429: ``Retry-After``, else a fixed wait."""
+    return exc.retry_after if exc.retry_after is not None else _RATE_LIMIT_FALLBACK_WAIT
+
+
+def _submission_fields(
+    locale: Optional[str],
+    aspect_ratio: Optional[str],
+    pages: Optional[str],
+    callback_url: Optional[str],
+) -> Dict[str, str]:
+    """The optional fields both kinds of submission carry, leaving out unset ones.
+
+    An empty or all-whitespace ``pages`` or ``callback_url`` means "not given" to
+    the service, so it is not sent at all.
+    """
+    if callback_url is not None and not isinstance(callback_url, str):
+        raise TypeError(f"callback_url must be a string, not {type(callback_url).__name__}")
+    fields: Dict[str, str] = {}
+    if locale is not None:
+        fields["locale"] = locale
+    if aspect_ratio is not None:
+        fields["aspectRatio"] = aspect_ratio
+    selection = normalize_pages(pages)
+    if selection is not None:
+        fields["pages"] = selection
+    if callback_url is not None and not is_blank(callback_url):
+        fields["callbackUrl"] = callback_url
+    return fields
+
+
 def _link_url(value: Optional[str]) -> Optional[str]:
     """Pull the URL out of a ``Link: <url>; rel=...`` header, or None."""
     if not value:
@@ -231,8 +335,8 @@ class _PreparedFile:
     Built before any connection is opened, so the request size is known up front.
 
     ``payload`` holds the bytes for an image (already compressed). For a PDF it is
-    ``None`` and the file is streamed from ``path`` instead, so a large PDF never
-    sits in memory — ``size`` is then its size on disk.
+    ``None`` and the file is read from ``path`` when the request is built — ``size``
+    is then its size on disk.
     """
 
     filename: str
@@ -321,67 +425,137 @@ class Image2PPTClient:
         *,
         locale: Optional[str] = None,
         aspect_ratio: Optional[str] = None,
+        pages: Optional[str] = None,
+        callback_url: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Job:
         """Submit a batch of files and create a conversion job.
 
         Checked locally before anything is uploaded: the files must add up to at
-        most 45MB and at most 50 pages. Over either limit this raises without
-        opening a connection — going over the size cap on the wire does not come
-        back as a clean error, it comes back as a dead connection.
+        most 90MB and at most 50 pages (the pages *selected*, when ``pages`` is
+        given), and ``pages`` must be spelled correctly. Over a limit this raises
+        without opening a connection — going over the size cap on the wire does not
+        come back as a clean error, it comes back as a dead connection.
 
-        **A failed submission is never retried automatically.** A connection error
-        does not tell you whether the request body made it: the job may not exist,
-        or it may exist with credits already reserved and only the response lost.
-        Retrying the second case charges twice, and without an idempotency key
-        there is no way to tell them apart — so the error is raised as-is. Check
-        ``account()`` or your job list before resending.
+        **Every submission carries an ``Idempotency-Key``**, and that is what makes
+        a failed one safe to resend: if an earlier attempt did create the job, the
+        service hands that job back (``job.replayed`` is True) instead of creating
+        and charging for a second one. So this call resends by itself, always with
+        the same key, when the outcome is unknown — a dropped connection, a
+        per-request timeout, or a 5xx (up to 2 more attempts, 1s and 2s apart) —
+        and waits out ``IDEMPOTENCY_KEY_IN_PROGRESS``, an earlier attempt the service
+        is still working on (up to 10 attempts / 3 minutes). A 429 is not retried
+        here; ``submit_all`` waits those out.
+
+        If it still fails, the key is on the exception as ``exc.idempotency_key``.
+        Calling ``submit`` again with that key and the same files and options is
+        safe for 24 hours; calling it without the key may create a second job.
 
         Args:
             paths: Local file paths (one or more). Supports png/jpeg/webp/gif/pdf,
-                each file <= 35MB, and <= 45MB of file content per request. An
+                each file <= 35MB, and <= 90MB of file content per request. An
                 image is 1 page, a PDF is its page count; the total must be
                 <= 50 pages. For more files than one request can hold, use
                 ``submit_all`` / ``convert_all``.
             locale: ``zh-CN`` (default) or ``en``.
             aspect_ratio: ``auto`` (default) / ``16:9`` / ``4:3``.
+            pages: Convert only these pages, e.g. ``"1-3, 7"``. Page numbers run
+                across the whole submission in order — an image is one page, a PDF
+                its page count — so with a single PDF they are the PDF's own. Only
+                the selected pages are charged and count towards the 50-page limit;
+                the PDF itself may be longer.
+            callback_url: An ``https`` URL the service POSTs to when the job ends.
+                Check each delivery with ``verify_webhook``.
+            idempotency_key: 1–255 printable ASCII characters. Default: a random
+                UUID per call. Pass your own to make resubmitting safe across calls
+                or processes — e.g. an id from your own database.
 
         Returns:
-            A ``Job`` with ``status`` ``pending``, plus ``slide_count`` and
-            ``credits_reserved`` (credits locked at submit time).
+            A ``Job`` with ``status`` ``pending`` (for a replay: the job's current
+            status), plus ``slide_count`` and ``credits_reserved`` (credits locked
+            at submit time).
 
         Raises:
             AuthenticationError, InvalidFileError (including the local per-file
             and ``PAYLOAD_TOO_LARGE`` pre-flight failures), TooManySlidesError,
-            InsufficientCreditsError, RateLimitedError.
-            ``APIConnectionError`` (``APITimeoutError`` for a per-request timeout)
-            for a transport failure — see above on why it is not retried, even
-            though it is marked transient for reads.
+            InvalidPagesError, PagesOutOfRangeError, InvalidCallbackUrlError,
+            InsufficientCreditsError, RateLimitedError,
+            IdempotencyKeyMismatchError (the key was used for a different request).
+            ``APIConnectionError`` (``APITimeoutError`` for a per-request timeout),
+            ``ServerError`` or ``IdempotencyKeyInProgressError`` once the retries
+            above run out.
         """
-        paths = list(paths)
+        paths = _string_list(paths, "paths", paths=True)
         if not paths:
             raise ValueError("at least one file is required")
-
-        data: Dict[str, str] = {}
-        if locale is not None:
-            data["locale"] = locale
-        if aspect_ratio is not None:
-            data["aspectRatio"] = aspect_ratio
-
+        key = _resolve_idempotency_key(idempotency_key)
+        fields = _submission_fields(locale, aspect_ratio, pages, callback_url)
+        # The spelling needs no files: refuse a typo before compressing anything.
+        # Range and count wait for the page total, so the error is the one the
+        # service would give.
+        if "pages" in fields:
+            parse_pages(fields["pages"])
         prepared = [self._prepare_file(path) for path in paths]
-        # Pre-flight, before a single byte goes out: an oversized request is not
-        # answered with an error, it is cut off — so it must never be sent.
-        for item in prepared:
-            check_file_size(item.path, item.size)
-        check_submission(
-            total_bytes=sum(item.size for item in prepared),
-            image_pages=sum(1 for item in prepared if item.is_image),
-            # A PDF's real page count is only known server-side; counting it as at
-            # least 1 is what stops "50 images + a PDF" from being sent as a
-            # submission that is certain to come back over the page limit.
-            pdf_files=sum(1 for item in prepared if not item.is_image),
+        self._check_prepared(prepared, fields.get("pages"))
+        return self._submit_with_key(lambda: self._post_files(prepared, fields, key), key)
+
+    def submit_urls(
+        self,
+        urls: Sequence[str],
+        *,
+        locale: Optional[str] = None,
+        aspect_ratio: Optional[str] = None,
+        pages: Optional[str] = None,
+        callback_url: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Job:
+        """Create a conversion job from files the service downloads itself.
+
+        Instead of uploading, hand over ``https`` links; the service fetches them in
+        order and converts them as one deck. The downloaded files are held to the
+        same limits as uploads (35MB each, 90MB together, 50 pages). File types are
+        judged by content, not by the link or its ``Content-Type``.
+
+        Downloading takes time — up to 60 seconds a link and 120 for the request —
+        so this call waits at least 180 seconds for an answer, whatever the client's
+        ``timeout``. Retries and ``idempotency_key`` work exactly as in ``submit``.
+        Only one submission by URL per account can be in flight at a time; another
+        gets a ``RateLimitedError``.
+
+        Args:
+            urls: 1–50 ``https`` links. Each must resolve to a public address.
+            locale, aspect_ratio, pages, callback_url, idempotency_key: as ``submit``.
+                With links the page total is not known here, so ``pages`` is only
+                checked for spelling and for selecting more than 50 pages.
+
+        Raises:
+            The errors of ``submit``, plus ``InvalidUrlError`` (a link was refused
+            before downloading) and ``UrlFetchFailedError`` (a download failed; may
+            be temporary). For those two — and ``InvalidFileError`` about a
+            downloaded file — ``exc.index`` says which link, counting from 0.
+            ``InvalidParameterError`` for more than 50 links, raised locally.
+        """
+        urls = _string_list(urls, "urls")
+        if not urls:
+            raise ValueError("at least one URL is required")
+        if len(urls) > _MAX_URLS:
+            raise InvalidParameterError(
+                f"{len(urls)} URLs in one submission, over the {_MAX_URLS} allowed",
+                code="INVALID_PARAMETER",
+            )
+        key = _resolve_idempotency_key(idempotency_key)
+        fields = _submission_fields(locale, aspect_ratio, pages, callback_url)
+        check_page_selection(fields.get("pages"))
+        body: Dict[str, Any] = {"urls": urls, **fields}
+        return self._submit_with_key(
+            lambda: self._post(
+                f"{self.base_url}/api/v1/jobs",
+                json=body,
+                headers={"Idempotency-Key": key},
+                timeout=max(self.timeout, _URL_SUBMIT_MIN_TIMEOUT),
+            ),
+            key,
         )
-        resp = self._post_files(prepared, data)
-        return Job.from_dict(self._parse_json(resp))
 
     def submit_all(
         self,
@@ -389,11 +563,12 @@ class Image2PPTClient:
         *,
         locale: Optional[str] = None,
         aspect_ratio: Optional[str] = None,
+        callback_url: Optional[str] = None,
     ) -> List[Job]:
         """Split files into submittable batches and create **one job per batch**.
 
         For a pile of files too big or too numerous for a single request. Batching
-        rules live in ``image2ppt._limits.plan_batches``: at most 40MB of file
+        rules live in ``image2ppt._limits.plan_batches``: at most 80MB of file
         content and at most 50 images per batch, and every PDF in a batch of its
         own (the SDK does not parse PDFs, so only the server knows their page
         count). Input order is preserved.
@@ -409,8 +584,12 @@ class Image2PPTClient:
         try the same batch again. Waiting is the normal path here. Total waiting is
         capped by the client's ``rate_limit_max_wait``.
 
-        **Connection errors are not retried** — see ``submit``. Only a 429 is,
-        because only a 429 proves the server did not take the submission.
+        **Each batch is its own submission with its own ``Idempotency-Key``**, and
+        is retried exactly as ``submit`` retries — plus the 429s above, with the
+        same key. There is no ``pages`` or ``idempotency_key`` option here: page
+        numbers run across one submission and a key names one job, so neither can
+        span several batches. Submit batches yourself with ``submit`` if you need
+        them.
 
         **If it does give up, the jobs already created are handed back on the
         exception**, in ``exc.submitted_jobs``. Those jobs are running on the
@@ -421,6 +600,7 @@ class Image2PPTClient:
             paths: Local file paths.
             locale: ``zh-CN`` (default) or ``en``.
             aspect_ratio: ``auto`` (default) / ``16:9`` / ``4:3``.
+            callback_url: As ``submit``; every batch's job calls it when it ends.
 
         Returns:
             One pending ``Job`` per batch, in batch order.
@@ -432,23 +612,27 @@ class Image2PPTClient:
             RateLimitedError: Still rate limited after ``rate_limit_max_wait``
                 seconds of waiting.
         """
-        paths = list(paths)
+        paths = _string_list(paths, "paths", paths=True)
         if not paths:
             raise ValueError("at least one file is required")
+        fields = _submission_fields(locale, aspect_ratio, None, callback_url)
 
-        batches = plan_batches(self._upload_items(paths))
+        # Planning measures every file; the compressed bytes are then dropped and each
+        # batch is prepared again when its turn comes, so memory holds one batch,
+        # not the whole pile. Compression is deterministic, so the sizes match.
+        batches = plan_batches(
+            UploadItem(path=item.path, size=item.size, is_pdf=not item.is_image)
+            for item in (self._prepare_file(path) for path in paths)
+        )
         budget = _WaitBudget(self.rate_limit_max_wait)
         jobs: List[Job] = []
         for batch in batches:
             try:
-                jobs.append(
-                    self._submit_batch(
-                        [item.path for item in batch],
-                        locale=locale,
-                        aspect_ratio=aspect_ratio,
-                        budget=budget,
-                    )
-                )
+                files = [self._prepare_file(item.path) for item in batch]
+                # Checked again: a file changed on disk since planning could push
+                # this batch over a limit, and an oversized request is cut off.
+                self._check_prepared(files, None)
+                jobs.append(self._submit_batch(files, fields, budget))
             except Exception as exc:
                 # Whatever went wrong, the earlier batches are already jobs on the
                 # server with credits reserved. Losing the ids would mean the caller
@@ -595,6 +779,9 @@ class Image2PPTClient:
         *,
         locale: Optional[str] = None,
         aspect_ratio: Optional[str] = None,
+        pages: Optional[str] = None,
+        callback_url: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
         poll_interval: float = 5.0,
         timeout: float = 1800.0,
     ) -> Job:
@@ -603,13 +790,31 @@ class Image2PPTClient:
         Arguments mirror ``submit`` and ``wait``. For the synchronous
         "give me a batch of images, hand me back a PPTX" case.
 
-        One job, one PPTX — the files must fit in a single submission (45MB of
+        One job, one PPTX — the files must fit in a single submission (90MB of
         file content, 50 pages). For more than that, ``convert_all`` splits the pile
         and writes one PPTX per batch.
         """
-        job = self.submit(paths, locale=locale, aspect_ratio=aspect_ratio)
-        completed = self.wait(job.job_id, poll_interval=poll_interval, timeout=timeout)
-        self.download(completed.job_id, dest_path)
+        # Resolved here, not in submit: a wait or download that fails after the job
+        # exists must hand back the key too, or retrying convert() would create and
+        # pay for a second job.
+        key = _resolve_idempotency_key(idempotency_key)
+        job = self.submit(
+            paths,
+            locale=locale,
+            aspect_ratio=aspect_ratio,
+            pages=pages,
+            callback_url=callback_url,
+            idempotency_key=key,
+        )
+        try:
+            completed = self.wait(job.job_id, poll_interval=poll_interval, timeout=timeout)
+            self.download(completed.job_id, dest_path)
+        except Exception as exc:
+            try:
+                exc.idempotency_key = key  # type: ignore[attr-defined]
+            except AttributeError:
+                pass  # exotic exception type with no __dict__: nothing we can do
+            raise
         return completed
 
     def convert_all(
@@ -619,6 +824,7 @@ class Image2PPTClient:
         *,
         locale: Optional[str] = None,
         aspect_ratio: Optional[str] = None,
+        callback_url: Optional[str] = None,
         poll_interval: float = 5.0,
         timeout: float = 1800.0,
     ) -> List[str]:
@@ -640,6 +846,7 @@ class Image2PPTClient:
                 nothing.
             locale: ``zh-CN`` (default) or ``en``.
             aspect_ratio: ``auto`` (default) / ``16:9`` / ``4:3``.
+            callback_url: As ``submit_all``.
             poll_interval: Initial poll interval in seconds.
             timeout: Wait cap **per job** in seconds, not for the whole pile.
 
@@ -661,7 +868,9 @@ class Image2PPTClient:
         # their output. This is the one step that can fail for free.
         _ensure_writable_dir(dest_dir)
 
-        jobs = self.submit_all(paths, locale=locale, aspect_ratio=aspect_ratio)
+        jobs = self.submit_all(
+            paths, locale=locale, aspect_ratio=aspect_ratio, callback_url=callback_url
+        )
 
         written: List[str] = []
         try:
@@ -676,6 +885,65 @@ class Image2PPTClient:
             _attach_submitted_jobs(exc, jobs)
             raise
         return written
+
+    def list_jobs(
+        self,
+        *,
+        created_from: Optional[str] = None,
+        created_to: Optional[str] = None,
+        limit: Optional[int] = None,
+        cursor: Optional[str] = None,
+    ) -> JobList:
+        """One page of the jobs this account submitted through the API, newest first.
+
+        Jobs deleted on the website are not listed. Each job has ``get_job``'s shape
+        minus ``page_results``; for reconciliation, add up ``credits_used`` and
+        ``credits_refunded``. To walk every page, use ``iter_jobs``.
+
+        Args:
+            created_from / created_to: ``YYYY-MM-DD`` in UTC, both inclusive; either
+                may be left out.
+            limit: Jobs per page, 1–100 (default 20).
+            cursor: ``next_cursor`` from the previous page, passed back unchanged.
+
+        Raises:
+            InvalidParameterError: A parameter is invalid; ``message`` says which.
+        """
+        params: Dict[str, Any] = {}
+        for name, value in (
+            ("createdFrom", created_from),
+            ("createdTo", created_to),
+            ("limit", limit),
+            ("cursor", cursor),
+        ):
+            # None and "" both mean "not given"; everything else goes as given, so
+            # the service is the one to judge it.
+            if value is not None and value != "":
+                params[name] = value
+        resp = self._get(f"{self.base_url}/api/v1/jobs", params=params)
+        return JobList.from_dict(self._parse_json(resp))
+
+    def iter_jobs(
+        self,
+        *,
+        created_from: Optional[str] = None,
+        created_to: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> Iterator[Job]:
+        """Every job ``list_jobs`` would list, following ``next_cursor`` to the end.
+
+        ``limit`` is the page size, not a cap on how many jobs come back. A 429 is
+        waited out (``Retry-After``, else 5s), and a page that fails in a way worth
+        repeating (``is_transient``) is fetched again after a short backoff — at
+        most 10 attempts per page before the error is raised.
+        """
+        cursor: Optional[str] = None
+        while True:
+            page = self._list_page_with_retries(created_from, created_to, limit, cursor)
+            yield from page.data
+            if page.next_cursor is None:
+                return
+            cursor = page.next_cursor
 
     def account(self) -> Dict[str, Any]:
         """Return account info: ``{"email": ..., "credits": available_credits}``."""
@@ -718,22 +986,19 @@ class Image2PPTClient:
         return resp
 
     def _submit_batch(
-        self,
-        paths: Sequence[str],
-        *,
-        locale: Optional[str],
-        aspect_ratio: Optional[str],
-        budget: _WaitBudget,
+        self, prepared: Sequence[_PreparedFile], fields: Dict[str, str], budget: _WaitBudget
     ) -> Job:
-        """Submit one batch, waiting out rate limits while ``budget`` allows.
+        """Submit one planned batch, waiting out rate limits while ``budget`` allows.
 
-        Retrying a 429 is not the same gamble as retrying a broken upload: a 429 is
-        the server saying it did *not* take the submission. Nothing was created and
-        nothing was charged, so trying the same batch again is free.
+        The batch is prepared and gets its ``Idempotency-Key`` once, before the loop,
+        so every attempt sends the very same request under the same key — what lets
+        the service recognise a resend.
 
-        Both flavors of 429 (per-minute page quota, concurrent-job cap) carry a
-        ``Retry-After`` and are handled identically. When the header is missing we
-        fall back to a fixed wait.
+        A 429 is the server saying it did *not* take the submission — nothing was
+        created and nothing charged — so trying the same batch again is free. Both
+        flavors (per-minute page quota, concurrent-job cap) carry a ``Retry-After``
+        and are handled identically; when the header is missing we fall back to a
+        fixed wait. Other failures are retried inside ``_submit_with_key``.
 
         Two things stop this: the shared waiting ``budget``, and
         ``_MAX_BATCH_ATTEMPTS``. The budget bounds time spent waiting; the attempt
@@ -741,21 +1006,126 @@ class Image2PPTClient:
         ``Retry-After: 1`` forever costs almost no budget per round while re-sending
         the whole batch every time.
         """
+        key = _resolve_idempotency_key(None)
         attempts_left = _MAX_BATCH_ATTEMPTS
         while True:
             try:
-                return self.submit(paths, locale=locale, aspect_ratio=aspect_ratio)
+                return self._submit_with_key(
+                    lambda: self._post_files(prepared, fields, key), key
+                )
             except RateLimitedError as exc:
                 attempts_left -= 1
-                delay = (
-                    exc.retry_after
-                    if exc.retry_after is not None
-                    else _RATE_LIMIT_FALLBACK_WAIT
-                )
                 # On the last attempt, do not wait first: nothing follows the wait,
                 # so it would only delay the error the caller is already getting.
-                if attempts_left <= 0 or not budget.spend(delay):
+                if attempts_left <= 0 or not budget.spend(_rate_limit_delay(exc)):
                     raise
+
+    def _check_prepared(self, prepared: Sequence[_PreparedFile], pages: Optional[str]) -> None:
+        """Pre-flight, before a single byte goes out: an oversized request is not
+        answered with an error, it is cut off — so it must never be sent."""
+        for item in prepared:
+            check_file_size(item.path, item.size)
+        check_submission(
+            total_bytes=sum(item.size for item in prepared),
+            image_pages=sum(1 for item in prepared if item.is_image),
+            # A PDF's real page count is only known server-side; counting it as at
+            # least 1 is what stops "50 images + a PDF" from being sent as a
+            # submission that is certain to come back over the page limit.
+            pdf_files=sum(1 for item in prepared if not item.is_image),
+            pages=pages,
+        )
+
+    def _submit_with_key(self, send: Callable[[], requests.Response], key: str) -> Job:
+        """Send one submission until its outcome is known; see ``submit`` for the rules.
+
+        ``send`` makes one attempt and must send the identical request every time,
+        under ``key``. Whatever finally escapes carries ``key`` as
+        ``idempotency_key``, so the caller can resend safely.
+
+        A 429 is left to the caller on purpose. By the contract, resending the
+        same request under a key whose job exists is answered with that job (and
+        one still being processed with "in progress"), so a 429 here still means
+        nothing was taken.
+        """
+        retries = iter(_SUBMIT_RETRY_DELAYS)
+        in_progress_attempts = 0
+        in_progress_budget = _WaitBudget(_IN_PROGRESS_MAX_WAIT)
+        attempt = 0
+        try:
+            while True:
+                attempt += 1
+                try:
+                    resp = send()
+                    job = Job.from_dict(self._parse_json(resp))
+                    job.replayed = (
+                        _response_header(resp.headers, "Idempotent-Replayed") or ""
+                    ).strip().lower() == "true"
+                    return job
+                except IdempotencyKeyInProgressError as exc:
+                    in_progress_attempts += 1
+                    first = exc.retry_after if exc.retry_after is not None else 2.0
+                    delay = min(first * 1.5 ** (in_progress_attempts - 1), _IN_PROGRESS_WAIT_CAP)
+                    if in_progress_attempts >= _IN_PROGRESS_MAX_ATTEMPTS or not (
+                        in_progress_budget.spend(delay)
+                    ):
+                        raise
+                except (APIConnectionError, ServerError):
+                    delay = next(retries, None)
+                    if delay is None:
+                        raise
+                    time.sleep(delay)
+                except IdempotencyKeyMismatchError as exc:
+                    if attempt > 1:
+                        # Only a request that created a job holds its key, so an
+                        # earlier attempt of this very call did — and the files
+                        # changed on disk in between, or this would have been a replay.
+                        exc.message += (
+                            "; an earlier attempt of this call did create a job with "
+                            "this key before the request changed (did a file change on "
+                            "disk?) — find it with list_jobs()"
+                        )
+                        exc.args = (exc.message,)
+                    raise
+        except Exception as exc:
+            # Not only SDK errors: a PDF that vanished between attempts raises an
+            # OSError, and the first attempt may already have created the job.
+            try:
+                exc.idempotency_key = key  # type: ignore[attr-defined]
+            except AttributeError:
+                pass  # exotic exception type with no __dict__: nothing we can do
+            raise
+
+    def _list_page_with_retries(
+        self,
+        created_from: Optional[str],
+        created_to: Optional[str],
+        limit: Optional[int],
+        cursor: Optional[str],
+    ) -> JobList:
+        """One ``list_jobs`` page for ``iter_jobs``, retried while that is worth it.
+
+        Listing is a read, so repeating it is free: a 429 waits ``Retry-After`` and
+        anything ``is_transient`` backs off, both within ``_MAX_BATCH_ATTEMPTS``.
+        """
+        backoff = 1.0
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return self.list_jobs(
+                    created_from=created_from,
+                    created_to=created_to,
+                    limit=limit,
+                    cursor=cursor,
+                )
+            except Image2PPTError as exc:
+                if attempt == _MAX_BATCH_ATTEMPTS or not exc.is_transient:
+                    raise
+                if isinstance(exc, RateLimitedError):
+                    time.sleep(_rate_limit_delay(exc))
+                else:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 15.0)
 
     def _prepare_file(self, path: str) -> _PreparedFile:
         """Resolve one path to its multipart part and its exact size on the wire."""
@@ -798,35 +1168,14 @@ class Image2PPTClient:
             is_image=True,
         )
 
-    def _upload_items(self, paths: Sequence[str]) -> List[UploadItem]:
-        """Measure files for batch planning, using the size they will occupy on the wire."""
-        return [
-            UploadItem(path=item.path, size=item.size, is_pdf=not item.is_image)
-            for item in (self._prepare_file(path) for path in paths)
-        ]
-
     def _post_files(
-        self, prepared: Sequence[_PreparedFile], data: Dict[str, str]
+        self, prepared: Sequence[_PreparedFile], fields: Dict[str, str], key: str
     ) -> requests.Response:
-        """POST the multipart submission exactly once.
+        """POST the multipart submission once, under ``key``.
 
-        **A failed submission is never retried automatically**, and that is
-        deliberate. An ``APIConnectionError`` proves only that this exchange broke;
-        it does *not* prove the request body was incomplete. The server may have
-        received the whole body, created the job and reserved the credits, and then
-        lost the connection on the way back with the response. Those two cases are
-        indistinguishable from here, and retrying the second one submits the same
-        files twice and charges twice.
-
-        Telling them apart needs an idempotency key the API does not offer, so the
-        error goes straight to the caller: check ``account()`` or your job list to
-        see whether the job exists, then decide whether to resend.
-
-        That is why ``is_transient`` has no say on this path. It answers "is this
-        read worth repeating", and a connection error is — reading twice costs
-        nothing. Submitting twice costs money, so the submit path stays on its own
-        rule and only a 429 is retried: a 429 is the server explicitly saying it
-        did *not* take the submission.
+        PDFs are reopened and read from disk on every attempt; images go from the
+        bytes compressed once in ``_prepare_file``, so a resend carries the same image
+        bytes as the first attempt.
         """
         opened = []
         multipart = []
@@ -841,7 +1190,8 @@ class Image2PPTClient:
             return self._post(
                 f"{self.base_url}/api/v1/jobs",
                 files=multipart,
-                data=data,
+                data=fields,
+                headers={"Idempotency-Key": key},
             )
         finally:
             for handle in opened:
@@ -948,6 +1298,7 @@ class Image2PPTClient:
         """Parse the ``{"error": {code, message}}`` envelope and raise the mapped error."""
         code: Optional[str] = None
         message: Optional[str] = None
+        index: Optional[int] = None
         # Reading the envelope is itself a read off the socket: on a ``download``
         # the response was opened with ``stream=True``, so the error body has not
         # arrived yet and the connection can still die here. A body that failed to
@@ -961,6 +1312,9 @@ class Image2PPTClient:
                 if isinstance(err, dict):
                     code = err.get("code")
                     message = err.get("message")
+                    raw_index = err.get("index")
+                    if _is_whole_number(raw_index) and raw_index >= 0:
+                        index = int(raw_index)
             except ValueError:
                 pass  # non-JSON error body (a gateway HTML page): fall back to status text
         message = message or f"request failed (HTTP {resp.status_code})"
@@ -972,6 +1326,7 @@ class Image2PPTClient:
             retry_after=self._parse_retry_after(
                 _response_header(resp.headers, "Retry-After")
             ),
+            index=index,
         )
 
     @staticmethod

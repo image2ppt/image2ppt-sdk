@@ -27,6 +27,21 @@ export class Image2PPTError extends Error {
    * thrown out of a batch call.
    */
   submittedJobs: Job[] = [];
+  /**
+   * Which entry of `urls` caused the error, counting from 0 — set only for errors
+   * the service ties to one link (`INVALID_URL`, `URL_FETCH_FAILED`, and
+   * `INVALID_FILE` / `PAYLOAD_TOO_LARGE` for a downloaded file). Undefined for
+   * everything else.
+   */
+  index?: number;
+  /**
+   * The `Idempotency-Key` the failed submission was sent with — set on every error
+   * thrown out of `submit` / `submitUrls` / `convert`, undefined elsewhere.
+   * **Submitting again with this same key is always safe** for 24 hours: if an
+   * earlier attempt did create the job, the service hands that job back instead of
+   * creating and charging for a second one.
+   */
+  idempotencyKey?: string;
 
   constructor(message: string, init: ErrorInit = {}) {
     super(message, "cause" in init ? { cause: init.cause } : undefined);
@@ -51,6 +66,9 @@ export class Image2PPTError extends Error {
    * on its own, everything else — a bad key, a job that does not exist, a
    * rejected file — will still be wrong in fifteen seconds. Subclasses that know
    * better override it.
+   *
+   * It says nothing about **writes**. Submitting has its own rule, built on the
+   * `Idempotency-Key` every submission carries — see `Image2PPTClient.submit`.
    */
   get isTransient(): boolean {
     return this.statusCode != null && this.statusCode >= 500;
@@ -65,9 +83,11 @@ export class Image2PPTError extends Error {
  *
  * **This does not tell you whether the server acted on the request.** For a
  * submission it is genuinely ambiguous — the job may not exist, or it may exist
- * with credits reserved and only the reply lost — which is why `submit` never
- * retries one for you. Polling a job's status has no such cost, so `wait()` does
- * back these off and retry (`isTransient` is true).
+ * with credits reserved and only the reply lost. `submit` still resends it, but
+ * only because every attempt carries the same `Idempotency-Key`, so the service
+ * hands back a job it already made instead of making a second one. Polling a job's
+ * status has no such cost, so `wait()` backs these off and retries too
+ * (`isTransient` is true).
  */
 export class APIConnectionError extends Image2PPTError {
   override get isTransient(): boolean {
@@ -136,7 +156,7 @@ export class AuthenticationError extends Image2PPTError {}
  * A file was rejected (400), or the request carried too much file content.
  *
  * Raised for an unsupported format, a single file over the 35MB per-file limit, or
- * a request whose files add up to more than the 45MB per-request limit
+ * a request whose files add up to more than the 90MB per-request limit
  * (413 `PAYLOAD_TOO_LARGE`). The client raises the `PAYLOAD_TOO_LARGE` case
  * locally, before uploading anything.
  */
@@ -146,10 +166,10 @@ export class InvalidFileError extends Image2PPTError {}
  * The upload was cut off before the body finished arriving (400 `UPLOAD_ABORTED`).
  *
  * The server is telling you it did **not** take the submission — no job was created
- * and no credits were reserved — so **resending the same files is safe**. That makes
- * this different from a transport-level fetch failure, which cannot rule out that the
- * job was created and only the response was lost; the client never retries that one
- * for you.
+ * and no credits were reserved — so **resending the same files is safe**. (After a
+ * transport-level fetch failure resending is safe too, but only with the same
+ * `idempotencyKey`: that one cannot rule out that the job was created and only the
+ * response was lost.)
  *
  * If it keeps happening the submission is probably too large for the link. Send fewer
  * files per request, or use `submitAll` / `convertAll` to split.
@@ -192,6 +212,104 @@ export class TooManySlidesError extends Image2PPTError {}
 
 /** Not enough available credits to cover the submission (402). */
 export class InsufficientCreditsError extends Image2PPTError {}
+
+/**
+ * An earlier request with the same `Idempotency-Key` is still being processed
+ * (409 `IDEMPOTENCY_KEY_IN_PROGRESS`).
+ *
+ * Typically the first attempt timed out on this side while the service was still
+ * working on it. Wait `retryAfter` seconds and send the same request with the same
+ * key: you get that job back once it exists. `submit` does this for you before
+ * giving up.
+ */
+export class IdempotencyKeyInProgressError extends Image2PPTError {
+  readonly retryAfter?: number;
+
+  constructor(message: string, init: ErrorInit & { retryAfter?: number } = {}) {
+    super(message, init);
+    this.retryAfter = init.retryAfter;
+  }
+
+  /** Always true — the earlier request will finish one way or the other. */
+  override get isTransient(): boolean {
+    return true;
+  }
+}
+
+/**
+ * The `Idempotency-Key` was already used for a *different* request in the last 24
+ * hours (422 `IDEMPOTENCY_KEY_MISMATCH`).
+ *
+ * "The same request" means the same file bytes in the same order (or the same
+ * `urls`), plus the same `locale`, `aspectRatio`, `pages` and `callbackUrl`. Use a
+ * new key for a new submission.
+ */
+export class IdempotencyKeyMismatchError extends Image2PPTError {}
+
+/**
+ * The `Idempotency-Key` is not 1–255 printable ASCII characters
+ * (400 `INVALID_IDEMPOTENCY_KEY`). Checked locally before anything is sent.
+ */
+export class InvalidIdempotencyKeyError extends Image2PPTError {}
+
+/**
+ * `callbackUrl` was refused (400 `INVALID_CALLBACK_URL`). It must be `https`, at
+ * most 2048 characters, carry no user name or password, and resolve only to public
+ * addresses.
+ */
+export class InvalidCallbackUrlError extends Image2PPTError {}
+
+/**
+ * `pages` is not a valid selection (400 `INVALID_PAGES`). Write single pages or
+ * `start-end` ranges separated by commas, counting from 1, e.g. `"1-3, 7"`; at most
+ * 1000 characters. Checked locally before anything is sent.
+ */
+export class InvalidPagesError extends Image2PPTError {}
+
+/**
+ * `pages` names page 0 or a page past the end of the submission
+ * (400 `PAGES_OUT_OF_RANGE`). The service's `message` says how many pages the
+ * submission has.
+ */
+export class PagesOutOfRangeError extends InvalidPagesError {}
+
+/**
+ * A request parameter has the wrong type or value (400 `INVALID_PARAMETER`, or
+ * `INVALID_JSON` for a body that is not a JSON object). Thrown for more than 50
+ * `urls`, and by `listJobs` for a bad `limit`, `cursor`, `createdFrom` or
+ * `createdTo` — the `message` says which.
+ */
+export class InvalidParameterError extends Image2PPTError {}
+
+/**
+ * One of `urls` was refused before downloading (400 `INVALID_URL`): not a valid
+ * `https` URL, carrying a user name or password, or pointing at a non-public
+ * address. `index` says which entry.
+ */
+export class InvalidUrlError extends Image2PPTError {}
+
+/**
+ * Downloading one of `urls` failed (400 `URL_FETCH_FAILED`): it did not resolve,
+ * answered non-2xx, timed out, redirected more than 4 times, or redirected to
+ * `http`. `index` says which entry.
+ *
+ * Transient: the other side may simply have been down for a moment, so submitting
+ * again later can work. It is not retried for you — every attempt counts against the
+ * per-minute page quota.
+ */
+export class UrlFetchFailedError extends Image2PPTError {
+  /** Always true — see the class comment. */
+  override get isTransient(): boolean {
+    return true;
+  }
+}
+
+/**
+ * A completion callback failed `verifyWebhook`: a header is missing, the timestamp is
+ * outside the tolerance, or no signature matches. Refuse that delivery (answer 4xx).
+ * A genuine one is retried by the service.
+ */
+export class WebhookVerificationError extends Image2PPTError {}
 
 /** The job id doesn't exist, or isn't owned by this key's account (404). */
 export class JobNotFoundError extends Image2PPTError {}
@@ -283,6 +401,16 @@ const CODE_TO_CLASS: Record<string, new (m: string, i?: ErrorInit) => Image2PPTE
   JOB_ALREADY_FINISHED: JobAlreadyFinishedError,
   NOT_READY: NotReadyError,
   OUTPUT_EXPIRED: OutputExpiredError,
+  IDEMPOTENCY_KEY_IN_PROGRESS: IdempotencyKeyInProgressError,
+  IDEMPOTENCY_KEY_MISMATCH: IdempotencyKeyMismatchError,
+  INVALID_IDEMPOTENCY_KEY: InvalidIdempotencyKeyError,
+  INVALID_CALLBACK_URL: InvalidCallbackUrlError,
+  INVALID_PAGES: InvalidPagesError,
+  PAGES_OUT_OF_RANGE: PagesOutOfRangeError,
+  INVALID_PARAMETER: InvalidParameterError,
+  INVALID_JSON: InvalidParameterError,
+  INVALID_URL: InvalidUrlError,
+  URL_FETCH_FAILED: UrlFetchFailedError,
 };
 const STATUS_TO_CLASS: Record<number, new (m: string, i?: ErrorInit) => Image2PPTError> = {
   401: AuthenticationError,
@@ -301,22 +429,29 @@ export function exceptionFor(args: {
   code?: string;
   message: string;
   retryAfter?: number;
+  index?: number;
 }): Image2PPTError {
-  const { statusCode, code, message, retryAfter } = args;
+  const { statusCode, code, message, retryAfter, index } = args;
+  let err: Image2PPTError;
   if (statusCode === 429) {
-    return new RateLimitedError(message, {
+    err = new RateLimitedError(message, {
       statusCode: 429,
       code: code ?? "RATE_LIMITED",
       retryAfter,
     });
+  } else if (code === "IDEMPOTENCY_KEY_IN_PROGRESS") {
+    err = new IdempotencyKeyInProgressError(message, { statusCode, code, retryAfter });
+  } else {
+    // A 5xx the maps do not claim is the service's own failure: retrying later is
+    // the contract's advice, so it gets a class that says so. Codes that already map
+    // to a specific class keep doing so, whatever status they arrive with — callers
+    // branch on `code`, and that must not change with the status line.
+    const cls =
+      (code && CODE_TO_CLASS[code]) ||
+      STATUS_TO_CLASS[statusCode] ||
+      (statusCode >= 500 ? ServerError : Image2PPTError);
+    err = new cls(message, { statusCode, code });
   }
-  // A 5xx the maps do not claim is the service's own failure: retrying later is
-  // the contract's advice, so it gets a class that says so. Codes that already map
-  // to a specific class keep doing so, whatever status they arrive with — callers
-  // branch on `code`, and that must not change with the status line.
-  const cls =
-    (code && CODE_TO_CLASS[code]) ||
-    STATUS_TO_CLASS[statusCode] ||
-    (statusCode >= 500 ? ServerError : Image2PPTError);
-  return new cls(message, { statusCode, code });
+  err.index = index;
+  return err;
 }
