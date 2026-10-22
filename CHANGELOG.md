@@ -3,6 +3,39 @@
 All notable changes to the image2ppt SDKs (Python + TypeScript) are documented
 here. The two clients share a single version number.
 
+## 0.7.0
+
+### Added
+
+- **Both clients** — optional `name` on upload, URL submission and conversion
+  calls, including batch calls. Names are task and download names without `.pptx`;
+  the service resolves collisions and returns the result on `Job.name` in create,
+  status, list and completion webhook snapshots. Older servers without `name`
+  read as `None` / `null`.
+- **Both clients** — `InvalidNameError` for `400 INVALID_NAME`. Names participate
+  in the `Idempotency-Key` fingerprint after the service's cleanup, so changing a
+  name with the same key raises `IdempotencyKeyMismatchError` unless the two clean
+  up to the same name.
+- **Both clients** — `on_progress` / `onProgress` on `wait`, `convert` and
+  `convert_all` / `convertAll`: called after every status poll, the final one
+  included, with the fresh `Job` (its `progress` is 0–100) and the time elapsed
+  since the wait started (seconds in Python, milliseconds in TypeScript). Polls
+  that failed and are being retried do not call it; anything the callback raises
+  ends the wait.
+- **Both clients** — job snapshots gain `estimated_remaining_seconds` /
+  `estimatedRemainingSeconds`, `queue_ahead` / `queueAhead` and `page_progress` /
+  `pageProgress` (one `{page number, progress, step label}` per page; the step
+  label is display text in the client's `Accept-Language`). They are set only
+  while a job is pending or running, and even then the estimate is absent until
+  one is available and the queue count is absent once the job has started; all
+  three are `None` / `null` once it ends. A malformed value in any of them reads
+  as absent rather than failing the poll, since they only feed a display.
+
+### Changed
+
+- **Docs** — clarify that `download()` writes to the caller's path and never uses
+  the server name. Batch conversion keeps `part-NN.pptx` output naming.
+
 ## 0.6.0
 
 Integration features for API 1.3.0: completion callbacks, safe resubmission,

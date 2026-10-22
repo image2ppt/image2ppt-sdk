@@ -47,6 +47,9 @@ from ._version import __version__
 
 DEFAULT_BASE_URL = "https://image2ppt.com"
 
+#: ``on_progress(job, elapsed_seconds)`` for ``wait`` / ``convert`` / ``convert_all``.
+ProgressCallback = Callable[[Job, float], None]
+
 _LOG = logging.getLogger("image2ppt")
 
 #: Sent on every request so the service knows which client version made it.
@@ -295,6 +298,7 @@ def _submission_fields(
     aspect_ratio: Optional[str],
     pages: Optional[str],
     callback_url: Optional[str],
+    name: Optional[str] = None,
 ) -> Dict[str, str]:
     """The optional fields both kinds of submission carry, leaving out unset ones.
 
@@ -313,6 +317,10 @@ def _submission_fields(
         fields["pages"] = selection
     if callback_url is not None and not is_blank(callback_url):
         fields["callbackUrl"] = callback_url
+    if name is not None:
+        if not isinstance(name, str):
+            raise TypeError(f"name must be a string, not {type(name).__name__}")
+        fields["name"] = name
     return fields
 
 
@@ -425,6 +433,7 @@ class Image2PPTClient:
         *,
         locale: Optional[str] = None,
         aspect_ratio: Optional[str] = None,
+        name: Optional[str] = None,
         pages: Optional[str] = None,
         callback_url: Optional[str] = None,
         idempotency_key: Optional[str] = None,
@@ -459,6 +468,8 @@ class Image2PPTClient:
                 ``submit_all`` / ``convert_all``.
             locale: ``zh-CN`` (default) or ``en``.
             aspect_ratio: ``auto`` (default) / ``16:9`` / ``4:3``.
+            name: Task name and download filename, without ``.pptx``. The
+                resolved name is returned on ``Job.name``. Validated by the service.
             pages: Convert only these pages, e.g. ``"1-3, 7"``. Page numbers run
                 across the whole submission in order — an image is one page, a PDF
                 its page count — so with a single PDF they are the PDF's own. Only
@@ -479,6 +490,7 @@ class Image2PPTClient:
             AuthenticationError, InvalidFileError (including the local per-file
             and ``PAYLOAD_TOO_LARGE`` pre-flight failures), TooManySlidesError,
             InvalidPagesError, PagesOutOfRangeError, InvalidCallbackUrlError,
+            InvalidNameError,
             InsufficientCreditsError, RateLimitedError,
             IdempotencyKeyMismatchError (the key was used for a different request).
             ``APIConnectionError`` (``APITimeoutError`` for a per-request timeout),
@@ -489,7 +501,7 @@ class Image2PPTClient:
         if not paths:
             raise ValueError("at least one file is required")
         key = _resolve_idempotency_key(idempotency_key)
-        fields = _submission_fields(locale, aspect_ratio, pages, callback_url)
+        fields = _submission_fields(locale, aspect_ratio, pages, callback_url, name)
         # The spelling needs no files: refuse a typo before compressing anything.
         # Range and count wait for the page total, so the error is the one the
         # service would give.
@@ -505,6 +517,7 @@ class Image2PPTClient:
         *,
         locale: Optional[str] = None,
         aspect_ratio: Optional[str] = None,
+        name: Optional[str] = None,
         pages: Optional[str] = None,
         callback_url: Optional[str] = None,
         idempotency_key: Optional[str] = None,
@@ -524,7 +537,7 @@ class Image2PPTClient:
 
         Args:
             urls: 1–50 ``https`` links. Each must resolve to a public address.
-            locale, aspect_ratio, pages, callback_url, idempotency_key: as ``submit``.
+            locale, aspect_ratio, name, pages, callback_url, idempotency_key: as ``submit``.
                 With links the page total is not known here, so ``pages`` is only
                 checked for spelling and for selecting more than 50 pages.
 
@@ -544,7 +557,7 @@ class Image2PPTClient:
                 code="INVALID_PARAMETER",
             )
         key = _resolve_idempotency_key(idempotency_key)
-        fields = _submission_fields(locale, aspect_ratio, pages, callback_url)
+        fields = _submission_fields(locale, aspect_ratio, pages, callback_url, name)
         check_page_selection(fields.get("pages"))
         body: Dict[str, Any] = {"urls": urls, **fields}
         return self._submit_with_key(
@@ -563,6 +576,7 @@ class Image2PPTClient:
         *,
         locale: Optional[str] = None,
         aspect_ratio: Optional[str] = None,
+        name: Optional[str] = None,
         callback_url: Optional[str] = None,
     ) -> List[Job]:
         """Split files into submittable batches and create **one job per batch**.
@@ -600,6 +614,8 @@ class Image2PPTClient:
             paths: Local file paths.
             locale: ``zh-CN`` (default) or ``en``.
             aspect_ratio: ``auto`` (default) / ``16:9`` / ``4:3``.
+            name: As ``submit``; reused for every batch, with collisions resolved
+                by the service.
             callback_url: As ``submit``; every batch's job calls it when it ends.
 
         Returns:
@@ -615,7 +631,7 @@ class Image2PPTClient:
         paths = _string_list(paths, "paths", paths=True)
         if not paths:
             raise ValueError("at least one file is required")
-        fields = _submission_fields(locale, aspect_ratio, None, callback_url)
+        fields = _submission_fields(locale, aspect_ratio, None, callback_url, name)
 
         # Planning measures every file; the compressed bytes are then dropped and each
         # batch is prepared again when its turn comes, so memory holds one batch,
@@ -669,6 +685,7 @@ class Image2PPTClient:
         *,
         poll_interval: float = 5.0,
         timeout: float = 1800.0,
+        on_progress: Optional[ProgressCallback] = None,
     ) -> Job:
         """Poll until the job reaches a terminal state; return the completed ``Job``.
 
@@ -681,8 +698,16 @@ class Image2PPTClient:
             job_id: The job id.
             poll_interval: Initial poll interval in seconds (default 5).
             timeout: Overall wait cap in seconds (default 1800 = 30 min).
+            on_progress: Called as ``on_progress(job, elapsed)`` after every
+                successful poll, the final one included — so a completed job
+                reports ``progress == 100`` before ``wait`` returns. ``job`` is the
+                fresh snapshot (``job.progress`` is 0-100, or ``None`` if the
+                service did not report it); ``elapsed`` is seconds since this
+                ``wait`` call started. Polls that failed and are being retried do
+                not call it. Anything it raises ends the wait and propagates.
         """
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        deadline = started + timeout
         interval = poll_interval
         while True:
             try:
@@ -707,6 +732,8 @@ class Image2PPTClient:
                 interval = min(interval * 1.5, 15.0)
                 continue
 
+            if on_progress is not None:
+                on_progress(job, time.monotonic() - started)
             if job.is_completed:
                 return job
             if job.is_failed:
@@ -725,6 +752,8 @@ class Image2PPTClient:
 
     def download(self, job_id: str, dest_path: str) -> str:
         """Stream a completed job's PPTX to ``dest_path``; return that path.
+
+        The server name never chooses the local path; only ``dest_path`` does.
 
         **``dest_path`` either holds a complete deck or is left exactly as it was.**
         The bytes go to a temporary file beside it and are renamed into place once
@@ -779,11 +808,13 @@ class Image2PPTClient:
         *,
         locale: Optional[str] = None,
         aspect_ratio: Optional[str] = None,
+        name: Optional[str] = None,
         pages: Optional[str] = None,
         callback_url: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         poll_interval: float = 5.0,
         timeout: float = 1800.0,
+        on_progress: Optional[ProgressCallback] = None,
     ) -> Job:
         """One-shot: submit -> wait for completion -> download to ``dest_path``.
 
@@ -802,12 +833,15 @@ class Image2PPTClient:
             paths,
             locale=locale,
             aspect_ratio=aspect_ratio,
+            name=name,
             pages=pages,
             callback_url=callback_url,
             idempotency_key=key,
         )
         try:
-            completed = self.wait(job.job_id, poll_interval=poll_interval, timeout=timeout)
+            completed = self.wait(
+                job.job_id, poll_interval=poll_interval, timeout=timeout, on_progress=on_progress
+            )
             self.download(completed.job_id, dest_path)
         except Exception as exc:
             try:
@@ -824,9 +858,11 @@ class Image2PPTClient:
         *,
         locale: Optional[str] = None,
         aspect_ratio: Optional[str] = None,
+        name: Optional[str] = None,
         callback_url: Optional[str] = None,
         poll_interval: float = 5.0,
         timeout: float = 1800.0,
+        on_progress: Optional[ProgressCallback] = None,
     ) -> List[str]:
         """Batch version of ``convert``: submit everything, wait, download each deck.
 
@@ -846,9 +882,13 @@ class Image2PPTClient:
                 nothing.
             locale: ``zh-CN`` (default) or ``en``.
             aspect_ratio: ``auto`` (default) / ``16:9`` / ``4:3``.
+            name: As ``submit_all``; output still uses ``part-NN.pptx``.
             callback_url: As ``submit_all``.
             poll_interval: Initial poll interval in seconds.
             timeout: Wait cap **per job** in seconds, not for the whole pile.
+            on_progress: As ``wait``, called for each job in turn while it is
+                waited on; tell the jobs apart by ``job.job_id``. ``elapsed``
+                restarts at zero for each job.
 
         Returns:
             The written file paths, in batch order.
@@ -869,13 +909,18 @@ class Image2PPTClient:
         _ensure_writable_dir(dest_dir)
 
         jobs = self.submit_all(
-            paths, locale=locale, aspect_ratio=aspect_ratio, callback_url=callback_url
+            paths, locale=locale, aspect_ratio=aspect_ratio, name=name, callback_url=callback_url
         )
 
         written: List[str] = []
         try:
             for index, job in enumerate(jobs, start=1):
-                completed = self.wait(job.job_id, poll_interval=poll_interval, timeout=timeout)
+                completed = self.wait(
+                    job.job_id,
+                    poll_interval=poll_interval,
+                    timeout=timeout,
+                    on_progress=on_progress,
+                )
                 dest_path = os.path.join(dest_dir, f"part-{index:02d}.pptx")
                 self.download(completed.job_id, dest_path)
                 written.append(dest_path)

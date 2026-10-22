@@ -32,6 +32,8 @@ Both also cover the integration side of the API:
   without any risk of being charged twice.
 - **Submit by URL** — hand over `https` links instead of uploading.
 - **Page selection** — convert only some pages (`"1-3, 7"`), and pay only for those.
+- **Task names** — optional `name` on submissions; the resolved name is on
+  `Job.name`, including status, list and completion webhook snapshots.
 - **Job list** — every API job with what it charged and refunded, for reconciliation.
 
 ## Quick look
@@ -40,7 +42,7 @@ Both also cover the integration side of the API:
 from image2ppt import Image2PPTClient
 
 client = Image2PPTClient(api_key="i2p_live_...")
-job = client.convert(["slide1.png", "report.pdf"], dest_path="out.pptx")
+job = client.convert(["slide1.png", "report.pdf"], dest_path="out.pptx", name="Quarterly report")
 print("done, credits used:", job.credits_used)
 ```
 
@@ -48,9 +50,34 @@ print("done, credits used:", job.credits_used)
 import { Image2PPTClient } from "image2ppt";
 
 const client = new Image2PPTClient({ apiKey: "i2p_live_..." });
-const job = await client.convert(["slide1.png", "report.pdf"], "out.pptx");
+const job = await client.convert(["slide1.png", "report.pdf"], "out.pptx", { name: "Quarterly report" });
 console.log("done, credits used:", job.creditsUsed);
 ```
+
+## Task names
+
+Pass `name` to upload, URL submission or conversion calls (also batch calls).
+It names the task and the service's download filename, without `.pptx`.
+Names must be non-empty, at most 60 Unicode characters and 180 UTF-8 bytes after
+invisible characters are removed and whitespace collapsed. Control characters and
+`/ \ : * ? " < > |` are forbidden, as are leading/trailing dots and Windows
+reserved names. Names are validated by the service; invalid names raise `InvalidNameError`
+(`INVALID_NAME`).
+
+An undeleted job in the same account with the same name causes the service to
+append ` (2)`, ` (3)`, etc.; use the returned `job.name`. Without `name`, a single
+input's cleaned filename without extension is used; multiple inputs or an unusable
+filename get `Slides YYYY-MM-DD HHMMSS UTC` at creation time. Website renames appear
+in later job snapshots. Older servers without the field return `None` in Python
+and `null` in TypeScript. `name` is part of the `Idempotency-Key` fingerprint,
+compared after the service's cleanup: reusing a key with a name that cleans up
+differently raises `IdempotencyKeyMismatchError`; one that differs only in what
+cleanup removes (extra spaces, invisible characters) replays the original job.
+
+`download()` always writes to the caller's path and never uses the server name,
+so task names cannot cause local filename collisions or overwrite other files.
+Existing files at the path you explicitly choose can still be replaced.
+`convert_all()` / `convertAll()` keep their `part-01.pptx`, `part-02.pptx`, ... naming.
 
 ## More files than one request can hold
 

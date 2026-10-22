@@ -222,6 +222,8 @@ export interface ClientOptions {
 
 /** Options every kind of submission takes, including the batch calls. */
 export interface SubmitAllOptions {
+  /** Task and download filename without `.pptx`; the service resolves collisions. */
+  name?: string;
   /**
    * Language of the **generated deck**: `zh-CN` (default) or `en`.
    *
@@ -266,6 +268,17 @@ export interface WaitOptions {
   pollIntervalMs?: number;
   /** Overall wait cap in ms (default 1_800_000 = 30 min). */
   timeoutMs?: number;
+  /**
+   * Called as `onProgress(job, elapsedMs)` after every successful poll, the final
+   * one included — so a completed job reports `progress === 100` before `wait`
+   * resolves. `job` is the fresh snapshot (`job.progress` is 0–100, or `null` if
+   * the service did not report it); `elapsedMs` is milliseconds since this `wait`
+   * call started. Polls that failed and are being retried do not call it. A
+   * returned promise is awaited before the next poll; anything it throws (or
+   * rejects with) ends the wait. In `convertAll` it is called for each job in turn
+   * — tell them apart by `job.jobId`; `elapsedMs` restarts at zero for each job.
+   */
+  onProgress?: (job: Job, elapsedMs: number) => void | Promise<void>;
 }
 
 export type ConvertOptions = SubmitOptions & WaitOptions;
@@ -360,6 +373,40 @@ export function wholeNumber(value: unknown): number | null {
   return Number.isInteger(value) ? (value as number) : null;
 }
 
+/** How far one page has got while the job is still running. */
+export interface PageProgress {
+  /** 1-based, numbered like `PageResult.pageNumber`. */
+  readonly pageNumber: number;
+  /** 0–100. */
+  readonly progress: number;
+  /**
+   * A short human-readable line about what the page is doing right now, in the
+   * language of the client's `acceptLanguage` (English by default), or `null`.
+   * Show it as-is; its wording changes as the service changes, so never branch
+   * on it.
+   */
+  readonly stepLabel: string | null;
+}
+
+/**
+ * Parse `pageProgress` leniently: it only feeds a progress display. Unlike
+ * `pageResults`, nothing is decided from it, so a malformed value reads as absent
+ * (or a malformed entry is skipped) rather than failing the poll.
+ */
+function parsePageProgress(value: unknown): PageProgress[] | null {
+  if (!Array.isArray(value)) return null;
+  const entries: PageProgress[] = [];
+  for (const item of value) {
+    if (!isJsonObject(item)) continue;
+    const pageNumber = wholeNumber(item.pageNumber);
+    const progress = wholeNumber(item.progress);
+    if (pageNumber != null && progress != null) {
+      entries.push({ pageNumber, progress, stepLabel: stringOrNull(item.stepLabel) });
+    }
+  }
+  return entries;
+}
+
 function stringOrNull(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
@@ -406,6 +453,8 @@ export class CallbackStatus {
 /** A snapshot of a conversion job's state. */
 export class Job {
   readonly jobId: string;
+  /** Current resolved task name, or null when an older server does not send it. */
+  readonly name: string | null;
   readonly status: JobStatus;
   readonly slideCount: number | null;
   readonly progress: number | null;
@@ -452,6 +501,18 @@ export class Job {
    * construction, since it comes from a header rather than the body.
    */
   replayed = false;
+  /**
+   * While the job runs: seconds the service expects it still needs. `null` while
+   * no estimate is available yet, and once the job has ended.
+   */
+  readonly estimatedRemainingSeconds: number | null;
+  /** Jobs ahead of this one while it waits to start; `null` once it is running. */
+  readonly queueAhead: number | null;
+  /**
+   * Per-page progress while the job is `pending` / `processing`, one entry per
+   * page; `null` otherwise. `progress` is the whole job's figure.
+   */
+  readonly pageProgress: PageProgress[] | null;
   /** Raw response body, for forward-compatible access to new fields. */
   readonly raw: Record<string, unknown>;
 
@@ -463,6 +524,7 @@ export class Job {
     // is why all three envelopes now go through one check.
     const d = requireFields(data, ["jobId", "status"], "job response");
     this.jobId = d.jobId;
+    this.name = stringOrNull(d.name);
     this.status = d.status;
     this.slideCount = d.slideCount ?? null;
     this.progress = d.progress ?? null;
@@ -485,6 +547,9 @@ export class Job {
     this.error = isJsonObject(d.error) ? (d.error as JobError) : null;
     this.pageResults = parsePageResults(d.pageResults);
     this.callback = CallbackStatus.fromJson(d.callback);
+    this.estimatedRemainingSeconds = wholeNumber(d.estimatedRemainingSeconds);
+    this.queueAhead = wholeNumber(d.queueAhead);
+    this.pageProgress = parsePageProgress(d.pageProgress);
     this.raw = data;
   }
 

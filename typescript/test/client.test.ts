@@ -687,6 +687,170 @@ describe("convert", () => {
 });
 
 // --------------------------------------------------------------------------- //
+// wait({ onProgress })
+// --------------------------------------------------------------------------- //
+describe("wait onProgress", () => {
+  it("reports every poll, the final one included, with a growing elapsed time", async () => {
+    const c = client(
+      fetchSequence(
+        json(200, { jobId: "j", status: "pending", progress: 0 }),
+        json(200, { jobId: "j", status: "processing", progress: 40 }),
+        json(200, { jobId: "j", status: "completed", progress: 100 }),
+      ),
+    );
+    const seen: [string, number | null, number][] = [];
+    const job = await c.wait("j", {
+      pollIntervalMs: 0,
+      onProgress: (j, elapsedMs) => {
+        seen.push([j.status, j.progress, elapsedMs]);
+      },
+    });
+    expect(job.isCompleted).toBe(true);
+    expect(seen.map(([s, p]) => [s, p])).toEqual([
+      ["pending", 0],
+      ["processing", 40],
+      ["completed", 100],
+    ]);
+    const elapsed = seen.map(([, , e]) => e);
+    expect(elapsed.every((e) => e >= 0)).toBe(true);
+    expect(elapsed).toEqual([...elapsed].sort((a, b) => a - b));
+  });
+
+  it("reports the failed snapshot before throwing", async () => {
+    const c = client(
+      fetchSequence(
+        json(200, {
+          jobId: "j",
+          status: "failed",
+          progress: 0,
+          error: { code: "CONVERSION_FAILED", message: "boom" },
+        }),
+      ),
+    );
+    const seen: string[] = [];
+    await expect(
+      c.wait("j", { pollIntervalMs: 0, onProgress: (j) => void seen.push(j.status) }),
+    ).rejects.toMatchObject({ name: "JobFailedError" });
+    expect(seen).toEqual(["failed"]);
+  });
+
+  it("does not report a poll that failed and was retried", async () => {
+    const c = client(
+      fetchSequence(
+        json(500, { error: { code: "STORAGE_FAILED", message: "oops" } }),
+        json(200, { jobId: "j", status: "completed", progress: 100 }),
+      ),
+    );
+    const seen: (number | null)[] = [];
+    await c.wait("j", { pollIntervalMs: 0, onProgress: (j) => void seen.push(j.progress) });
+    expect(seen).toEqual([100]);
+  });
+
+  it("awaits an async callback, and its rejection ends the wait", async () => {
+    const f = fetchSequence(json(200, { jobId: "j", status: "processing", progress: 10 }));
+    const stop = new Error("stop");
+    await expect(
+      client(f).wait("j", {
+        pollIntervalMs: 0,
+        onProgress: async () => {
+          await Promise.resolve();
+          throw stop;
+        },
+      }),
+    ).rejects.toBe(stop);
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it("is passed through by convert", async () => {
+    const file = await tempFile();
+    const c = client(
+      fetchSequence(
+        json(201, { jobId: "j", status: "pending", slideCount: 1 }),
+        json(200, { jobId: "j", status: "processing", progress: 50 }),
+        json(200, { jobId: "j", status: "completed", progress: 100 }),
+        new Response(Buffer.from("PPTXDATA"), { status: 200 }),
+      ),
+    );
+    const seen: (number | null)[] = [];
+    await c.convert([file], join(dir, "out.pptx"), {
+      pollIntervalMs: 0,
+      onProgress: (j) => void seen.push(j.progress),
+    });
+    expect(seen).toEqual([50, 100]);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// live progress fields: estimatedRemainingSeconds / queueAhead / pageProgress
+// --------------------------------------------------------------------------- //
+describe("live progress fields", () => {
+  it("reads them from a running job", () => {
+    const job = new Job({
+      jobId: "j",
+      status: "processing",
+      progress: 37,
+      estimatedRemainingSeconds: 140,
+      queueAhead: null,
+      pageProgress: [
+        { pageNumber: 1, progress: 100, stepLabel: null },
+        { pageNumber: 2, progress: 45, stepLabel: "Read text and icons" },
+      ],
+    });
+    expect(job.estimatedRemainingSeconds).toBe(140);
+    expect(job.queueAhead).toBeNull();
+    expect(job.pageProgress).toEqual([
+      { pageNumber: 1, progress: 100, stepLabel: null },
+      { pageNumber: 2, progress: 45, stepLabel: "Read text and icons" },
+    ]);
+  });
+
+  it("reads them as absent when the service does not send them", () => {
+    const job = new Job({ jobId: "j", status: "completed", progress: 100 });
+    expect(job.estimatedRemainingSeconds).toBeNull();
+    expect(job.queueAhead).toBeNull();
+    expect(job.pageProgress).toBeNull();
+  });
+
+  it("does not fail the poll over a malformed value", () => {
+    const job = new Job({
+      jobId: "j",
+      status: "pending",
+      estimatedRemainingSeconds: "soon",
+      queueAhead: 2.5,
+      pageProgress: [
+        { pageNumber: 1, progress: "x" },
+        "junk",
+        { pageNumber: 2, progress: 0, stepLabel: 7 },
+      ],
+    });
+    expect(job.estimatedRemainingSeconds).toBeNull();
+    expect(job.queueAhead).toBeNull();
+    expect(job.pageProgress).toEqual([{ pageNumber: 2, progress: 0, stepLabel: null }]);
+    expect(new Job({ jobId: "j", status: "pending", pageProgress: {} }).pageProgress).toBeNull();
+  });
+
+  it("reaches onProgress", async () => {
+    const c = client(
+      fetchSequence(
+        json(200, { jobId: "j", status: "pending", progress: 0, queueAhead: 3 }),
+        json(200, { jobId: "j", status: "processing", progress: 20, estimatedRemainingSeconds: 200 }),
+        json(200, { jobId: "j", status: "completed", progress: 100 }),
+      ),
+    );
+    const seen: [number | null, number | null][] = [];
+    await c.wait("j", {
+      pollIntervalMs: 0,
+      onProgress: (j) => void seen.push([j.queueAhead, j.estimatedRemainingSeconds]),
+    });
+    expect(seen).toEqual([
+      [3, null],
+      [null, 200],
+      [null, null],
+    ]);
+  });
+});
+
+// --------------------------------------------------------------------------- //
 // client-side image preparation — behavior matched to the Python SDK
 // --------------------------------------------------------------------------- //
 describe("client-side image preparation", () => {
@@ -1090,8 +1254,13 @@ describe("convertAll", () => {
       new Response(Buffer.from("DECK-B"), { status: 200 }),
     );
 
-    const written = await client(f).convertAll(files, outDir, { pollIntervalMs: 0 });
+    const seen: string[] = [];
+    const written = await client(f).convertAll(files, outDir, {
+      pollIntervalMs: 0,
+      onProgress: (j) => void seen.push(j.jobId),
+    });
 
+    expect(seen).toEqual(["job_a", "job_b"]);
     expect(written).toEqual([join(outDir, "part-01.pptx"), join(outDir, "part-02.pptx")]);
     expect((await readFile(written[0])).toString()).toBe("DECK-A");
     expect((await readFile(written[1])).toString()).toBe("DECK-B");

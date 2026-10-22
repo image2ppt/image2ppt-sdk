@@ -221,6 +221,52 @@ class PageResult:
         )
 
 
+@dataclass
+class PageProgress:
+    """How far one page has got while the job is still running.
+
+    ``page_number`` is 1-based, numbered like ``PageResult.page_number``;
+    ``progress`` is 0-100. ``step_label`` is a short human-readable line about
+    what the page is doing right now, in the language of the client's
+    ``accept_language`` (English by default), or ``None``. Show it as-is; its
+    wording changes as the service changes, so never branch on it.
+    """
+
+    page_number: int
+    progress: int
+    step_label: Optional[str] = None
+
+
+def _whole_or_none(value: Any) -> Optional[int]:
+    """``value`` as an int if it is a whole number, else None."""
+    return int(value) if _is_whole_number(value) else None
+
+
+def _parse_page_progress(value: Any) -> Optional[List[PageProgress]]:
+    """Parse ``pageProgress`` leniently: it only feeds a progress display.
+
+    Unlike ``pageResults``, nothing is decided from it, so a malformed value reads
+    as absent (or a malformed entry is skipped) rather than failing the poll.
+    """
+    if not isinstance(value, list):
+        return None
+    entries = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        page = _whole_or_none(item.get("pageNumber"))
+        progress = _whole_or_none(item.get("progress"))
+        if page is not None and progress is not None:
+            entries.append(
+                PageProgress(
+                    page_number=page,
+                    progress=progress,
+                    step_label=_str_or_none(item.get("stepLabel")),
+                )
+            )
+    return entries
+
+
 def _str_or_none(value: Any) -> Optional[str]:
     """``value`` if it is a string, else None."""
     return value if isinstance(value, str) else None
@@ -281,7 +327,7 @@ class Job:
     job_id: str
     status: str  # pending | processing | completed | failed
     slide_count: Optional[int] = None
-    progress: Optional[int] = None  # 0-100
+    progress: Optional[int] = None  # 0-100, whole job
     credits_reserved: Optional[int] = None  # submit response: credits locked
     credits_used: Optional[int] = None  # settled: credits actually charged
     credits_refunded: Optional[int] = None  # partial success: refunded failed pages
@@ -321,6 +367,16 @@ class Job:
     #: ``Idempotency-Key`` (response header ``Idempotent-Replayed: true``) instead of
     #: creating it now. Nothing was charged for the replay.
     replayed: bool = False
+    #: Resolved task name, without ``.pptx``; absent on older servers.
+    name: Optional[str] = None
+    #: While the job runs: seconds the service expects it still needs. ``None``
+    #: while no estimate is available yet, and once the job has ended.
+    estimated_remaining_seconds: Optional[int] = None
+    #: Jobs ahead of this one while it waits to start; ``None`` once it is running.
+    queue_ahead: Optional[int] = None
+    #: Per-page progress while the job is ``pending`` / ``processing``, one entry
+    #: per page; ``None`` otherwise. ``progress`` is the whole job's figure.
+    page_progress: Optional[List[PageProgress]] = None
 
     @property
     def is_completed(self) -> bool:
@@ -363,6 +419,7 @@ class Job:
         return cls(
             job_id=data["jobId"],
             status=data["status"],
+            name=_str_or_none(data.get("name")),
             slide_count=data.get("slideCount"),
             progress=data.get("progress"),
             credits_reserved=data.get("creditsReserved"),
@@ -381,6 +438,9 @@ class Job:
             page_results=_parse_page_results(data.get("pageResults")),
             callback=CallbackStatus.from_dict(data.get("callback")),
             raw=data,
+            estimated_remaining_seconds=_whole_or_none(data.get("estimatedRemainingSeconds")),
+            queue_ahead=_whole_or_none(data.get("queueAhead")),
+            page_progress=_parse_page_progress(data.get("pageProgress")),
         )
 
 

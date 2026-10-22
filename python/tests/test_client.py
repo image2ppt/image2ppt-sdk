@@ -784,8 +784,12 @@ def test_convert_all_writes_one_numbered_pptx_per_batch(tmp_path):
     ])
     handler = lambda *a, **k: next(responses)
 
-    written = make_client(handler).convert_all(paths, str(out_dir), poll_interval=0)
+    seen = []
+    written = make_client(handler).convert_all(
+        paths, str(out_dir), poll_interval=0, on_progress=lambda j, _: seen.append(j.job_id)
+    )
 
+    assert seen == ["job_a", "job_b"]
     assert written == [str(out_dir / "part-01.pptx"), str(out_dir / "part-02.pptx")]
     assert (out_dir / "part-01.pptx").read_bytes() == b"DECK-A"
     assert (out_dir / "part-02.pptx").read_bytes() == b"DECK-B"
@@ -2375,10 +2379,14 @@ def test_new_job_fields_are_appended_after_the_old_ones():
     at the end, so no existing positional call changes meaning."""
     import dataclasses
 
-    assert [f.name for f in dataclasses.fields(Job)][-3:] == [
+    assert [f.name for f in dataclasses.fields(Job)][-7:] == [
         "page_results",
         "callback",
         "replayed",
+        "name",
+        "estimated_remaining_seconds",
+        "queue_ahead",
+        "page_progress",
     ]
 
 
@@ -2468,3 +2476,135 @@ def test_wait_on_a_failed_job_whose_error_is_not_an_object_raises_ours(bad_error
         client.wait("job_1", poll_interval=0, timeout=5)
     assert excinfo.value.code is None
     assert excinfo.value.message == "conversion failed"
+
+
+# --------------------------------------------------------------------------- #
+# wait(on_progress=...)
+# --------------------------------------------------------------------------- #
+def test_wait_reports_every_poll_to_on_progress_including_the_last():
+    seq = iter([
+        {"jobId": "j", "status": "pending", "progress": 0},
+        {"jobId": "j", "status": "processing", "progress": 40},
+        {"jobId": "j", "status": "completed", "progress": 100, "downloadUrl": "/api/v1/jobs/j/download"},
+    ])
+    handler = lambda *a, **k: FakeResponse(200, next(seq))
+    seen = []
+    job = make_client(handler).wait(
+        "j", poll_interval=0, on_progress=lambda j, elapsed: seen.append((j.status, j.progress, elapsed))
+    )
+    assert job.is_completed
+    assert [(s, p) for s, p, _ in seen] == [("pending", 0), ("processing", 40), ("completed", 100)]
+    elapsed = [e for _, _, e in seen]
+    assert all(isinstance(e, float) and e >= 0 for e in elapsed)
+    assert elapsed == sorted(elapsed)
+
+
+def test_wait_reports_the_failed_snapshot_before_raising():
+    handler = lambda *a, **k: FakeResponse(200, {
+        "jobId": "j", "status": "failed", "progress": 0,
+        "error": {"code": "CONVERSION_FAILED", "message": "boom"},
+    })
+    seen = []
+    with pytest.raises(JobFailedError):
+        make_client(handler).wait("j", poll_interval=0, on_progress=lambda j, _: seen.append(j.status))
+    assert seen == ["failed"]
+
+
+def test_wait_does_not_report_polls_that_failed():
+    seq = iter([
+        FakeResponse(500, {"error": {"code": "STORAGE_FAILED", "message": "oops"}}),
+        FakeResponse(200, {"jobId": "j", "status": "completed", "progress": 100}),
+    ])
+    handler = lambda *a, **k: next(seq)
+    seen = []
+    make_client(handler).wait("j", poll_interval=0, on_progress=lambda j, _: seen.append(j.progress))
+    assert seen == [100]
+
+
+def test_an_exception_from_on_progress_ends_the_wait():
+    calls = []
+
+    def handler(*a, **k):
+        calls.append(1)
+        return FakeResponse(200, {"jobId": "j", "status": "processing", "progress": 10})
+
+    def stop(job, elapsed):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        make_client(handler).wait("j", poll_interval=0, on_progress=stop)
+    assert len(calls) == 1
+
+
+def test_convert_passes_on_progress_through_to_wait(tmp_path):
+    src = tmp_path / "a.png"
+    src.write_bytes(png_bytes())
+    responses = iter([
+        FakeResponse(201, {"jobId": "j", "status": "pending", "slideCount": 1}),
+        FakeResponse(200, {"jobId": "j", "status": "processing", "progress": 50}),
+        FakeResponse(200, {"jobId": "j", "status": "completed", "progress": 100}),
+        FakeResponse(200, content=b"PK-pptx"),
+    ])
+    seen = []
+    make_client(lambda *a, **k: next(responses)).convert(
+        [str(src)], str(tmp_path / "out.pptx"), poll_interval=0,
+        on_progress=lambda j, _: seen.append(j.progress),
+    )
+    assert seen == [50, 100]
+
+
+# --------------------------------------------------------------------------- #
+# live progress fields: estimatedRemainingSeconds / queueAhead / pageProgress
+# --------------------------------------------------------------------------- #
+def test_job_reads_the_live_progress_fields():
+    job = Job.from_dict({
+        "jobId": "j", "status": "processing", "progress": 37,
+        "estimatedRemainingSeconds": 140, "queueAhead": None,
+        "pageProgress": [
+            {"pageNumber": 1, "progress": 100, "stepLabel": None},
+            {"pageNumber": 2, "progress": 45, "stepLabel": "Read text and icons"},
+        ],
+    })
+    assert job.estimated_remaining_seconds == 140
+    assert job.queue_ahead is None
+    assert [(p.page_number, p.progress, p.step_label) for p in job.page_progress] == [
+        (1, 100, None),
+        (2, 45, "Read text and icons"),
+    ]
+
+
+def test_job_without_live_progress_fields_reads_them_as_absent():
+    job = Job.from_dict({"jobId": "j", "status": "completed", "progress": 100})
+    assert job.estimated_remaining_seconds is None
+    assert job.queue_ahead is None
+    assert job.page_progress is None
+
+
+def test_malformed_live_progress_fields_do_not_fail_the_poll():
+    job = Job.from_dict({
+        "jobId": "j", "status": "pending",
+        "estimatedRemainingSeconds": "soon", "queueAhead": 2.5,
+        "pageProgress": [
+            {"pageNumber": 1, "progress": "x"},
+            "junk",
+            {"pageNumber": 2, "progress": 0, "stepLabel": 7},
+        ],
+    })
+    assert job.estimated_remaining_seconds is None
+    assert job.queue_ahead is None
+    assert [(p.page_number, p.progress, p.step_label) for p in job.page_progress] == [(2, 0, None)]
+    assert Job.from_dict({"jobId": "j", "status": "pending", "pageProgress": {}}).page_progress is None
+
+
+def test_on_progress_sees_the_estimate():
+    seq = iter([
+        {"jobId": "j", "status": "pending", "progress": 0, "queueAhead": 3},
+        {"jobId": "j", "status": "processing", "progress": 20, "estimatedRemainingSeconds": 200},
+        {"jobId": "j", "status": "completed", "progress": 100},
+    ])
+    seen = []
+    make_client(lambda *a, **k: FakeResponse(200, next(seq))).wait(
+        "j", poll_interval=0,
+        on_progress=lambda j, _: seen.append((j.queue_ahead, j.estimated_remaining_seconds)),
+    )
+    assert seen == [(3, None), (None, 200), (None, None)]

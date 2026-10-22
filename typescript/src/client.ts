@@ -155,6 +155,12 @@ function submissionFields(options: SubmitOptions): Record<string, string> {
     throw new TypeError(`callbackUrl must be a string, not ${typeof callbackUrl}`);
   }
   const fields: Record<string, string> = {};
+  if (options.name != null) {
+    if (typeof options.name !== "string") {
+      throw new TypeError(`name must be a string, not ${typeof options.name}`);
+    }
+    fields.name = options.name;
+  }
   if (options.locale != null) fields.locale = options.locale;
   if (options.aspectRatio != null) fields.aspectRatio = options.aspectRatio;
   const selection = normalizePages(options.pages);
@@ -832,7 +838,8 @@ export class Image2PPTClient {
     const timeout = options.timeoutMs ?? 1_800_000;
     // Monotonic clock so a system-time jump can't skew the deadline (mirrors the
     // Python client's time.monotonic()).
-    const deadline = performance.now() + timeout;
+    const started = performance.now();
+    const deadline = started + timeout;
     let interval = pollInterval;
 
     for (;;) {
@@ -863,6 +870,7 @@ export class Image2PPTClient {
         continue;
       }
 
+      await options.onProgress?.(job, performance.now() - started);
       if (job.isCompleted) return job;
       if (job.isFailed) {
         const err = job.error ?? undefined;

@@ -241,7 +241,7 @@ export class IdempotencyKeyInProgressError extends Image2PPTError {
  * hours (422 `IDEMPOTENCY_KEY_MISMATCH`).
  *
  * "The same request" means the same file bytes in the same order (or the same
- * `urls`), plus the same `locale`, `aspectRatio`, `pages` and `callbackUrl`. Use a
+ * `urls`), plus the same `locale`, `aspectRatio`, `pages`, `callbackUrl` and `name`. Use a
  * new key for a new submission.
  */
 export class IdempotencyKeyMismatchError extends Image2PPTError {}
@@ -258,6 +258,9 @@ export class InvalidIdempotencyKeyError extends Image2PPTError {}
  * addresses.
  */
 export class InvalidCallbackUrlError extends Image2PPTError {}
+
+/** The task name was refused (400 `INVALID_NAME`). */
+export class InvalidNameError extends Image2PPTError {}
 
 /**
  * `pages` is not a valid selection (400 `INVALID_PAGES`). Write single pages or
@@ -405,6 +408,7 @@ const CODE_TO_CLASS: Record<string, new (m: string, i?: ErrorInit) => Image2PPTE
   IDEMPOTENCY_KEY_MISMATCH: IdempotencyKeyMismatchError,
   INVALID_IDEMPOTENCY_KEY: InvalidIdempotencyKeyError,
   INVALID_CALLBACK_URL: InvalidCallbackUrlError,
+  INVALID_NAME: InvalidNameError,
   INVALID_PAGES: InvalidPagesError,
   PAGES_OUT_OF_RANGE: PagesOutOfRangeError,
   INVALID_PARAMETER: InvalidParameterError,

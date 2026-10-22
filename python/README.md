@@ -44,6 +44,38 @@ job = client.wait(job.job_id, poll_interval=5, timeout=1800)
 client.download(job.job_id, "out.pptx")
 ```
 
+Show progress to your own users — `on_progress` is called after every status poll
+(the last one included) with the fresh `Job` and the seconds elapsed since `wait`
+started. `convert` and `convert_all` take it too.
+
+```python
+def show(job, elapsed):
+    if job.queue_ahead is not None:
+        print(f"queued, {job.queue_ahead} job(s) ahead")
+    elif job.estimated_remaining_seconds is not None:
+        print(f"{job.progress}% — about {job.estimated_remaining_seconds}s left")
+    else:
+        print(f"{job.progress or 0}% — estimating…")
+
+job = client.wait(job.job_id, on_progress=show)
+```
+
+While a job is running, each snapshot carries:
+
+- `progress` — the whole job, 0–100. It moves within a page, so a one-page job
+  climbs steadily instead of jumping from 0 to 100.
+- `page_progress` — one `PageProgress(page_number, progress, step_label)` per page.
+  `step_label` is a short line about what that page is doing right now, in the
+  language of `accept_language` (English by default), or `None`. Show it as-is
+  and never branch on it: its wording changes as the service changes.
+- `estimated_remaining_seconds` — the service's estimate of the time left. It can
+  be `None` while the job runs, when no estimate is available yet.
+- `queue_ahead` — jobs ahead of this one while it waits to start.
+
+`page_progress`, `estimated_remaining_seconds` and `queue_ahead` are `None` once
+the job has ended. Anything `on_progress`
+raises ends the wait and propagates.
+
 Cancel a job you no longer need:
 
 ```python
@@ -77,6 +109,42 @@ Check your balance:
 info = client.account()
 print(info["email"], "credits:", info["credits"])
 ```
+
+## Task names — `name`
+
+```python
+job = client.submit(["report.pdf"], name="Quarterly report")
+job = client.submit_urls(["https://example.com/report.pdf"], name="Quarterly report")
+job = client.convert(["report.pdf"], "local.pptx", name="Quarterly report")
+print(job.name)  # resolved name, possibly "Quarterly report (2)"
+```
+
+`name` is optional on submissions and conversion calls, including `submit_all()` / `convert_all()`.
+Batch calls reuse it for each job; the service resolves each collision. It is the
+task name and the service's download filename, without `.pptx`. After invisible
+characters are removed and whitespace collapsed, it must be non-empty, at most
+60 Unicode characters and 180 UTF-8 bytes. Control characters and `/ \ : * ? " < > |`
+are forbidden, as are leading/trailing dots and Windows reserved names. An invalid
+name raises `InvalidNameError` with code `INVALID_NAME`. The service validates
+and normalizes name contents; the SDK sends the supplied string unchanged.
+
+Names already used by undeleted jobs in the same account get ` (2)`, ` (3)`, etc.
+The resolved name is on `Job.name` in create responses, `get_job()` and job lists;
+completion webhook payloads also include it. A rename on the website appears in
+later snapshots. Older servers that omit it give `None`. Without `name`, one
+input uses its cleaned filename without extension; multiple inputs or an unusable
+filename use `Slides YYYY-MM-DD HHMMSS UTC` at creation time.
+
+`name` participates in the `Idempotency-Key` fingerprint, compared after the
+service's cleanup. Reusing a key with a name that cleans up differently raises
+`IdempotencyKeyMismatchError`, just like changing other submission options; a name
+that differs only in what cleanup removes (extra spaces, invisible characters)
+replays the original job.
+
+`download()` writes to the caller's path and never uses the server name, so a task
+name cannot cause local filename collisions or overwrite other files. Existing
+files at your explicitly chosen path can still be replaced. `convert_all()` keeps
+`part-01.pptx`, `part-02.pptx`, ... naming regardless of task names.
 
 ## Convert only some pages — `pages`
 
@@ -374,6 +442,7 @@ Every exception this client raises about a *request* subclasses `Image2PPTError`
 | `IdempotencyKeyInProgressError` | 409 | `IDEMPOTENCY_KEY_IN_PROGRESS` (has `retry_after`) — an earlier request with this key is still being processed |
 | `InvalidUrlError` | 400 | `INVALID_URL` — a link was refused before downloading (`e.index` says which) |
 | `UrlFetchFailedError` | 400 | `URL_FETCH_FAILED` — downloading a link failed; may be temporary (`e.index` says which) |
+| `InvalidNameError` | 400 | `INVALID_NAME` — invalid task name |
 | `InvalidParameterError` | 400 | `INVALID_PARAMETER`, `INVALID_JSON` — e.g. more than 50 `urls`, or a bad `list_jobs` argument |
 | `PageRateExceededError` | 400 | `PAGE_RATE_EXCEEDED` — this one submission has more pages than a minute's quota, so waiting will not help; split it |
 | `InsufficientCreditsError` | 402 | `INSUFFICIENT_CREDITS` |

@@ -24,7 +24,7 @@ from ._limits import (
     check_submission,
     plan_batches,
 )
-from .client import DEFAULT_BASE_URL, Image2PPTClient
+from .client import DEFAULT_BASE_URL, Image2PPTClient, ProgressCallback
 from .errors import (
     APIConnectionError,
     APITimeoutError,
@@ -38,6 +38,7 @@ from .errors import (
     InvalidCallbackUrlError,
     InvalidFileError,
     InvalidIdempotencyKeyError,
+    InvalidNameError,
     InvalidPagesError,
     InvalidParameterError,
     InvalidUrlError,
@@ -59,14 +60,24 @@ from .errors import (
     UrlFetchFailedError,
     WebhookVerificationError,
 )
-from .models import CallbackStatus, CancellationResult, Job, JobList, PageError, PageResult
+from .models import (
+    CallbackStatus,
+    CancellationResult,
+    Job,
+    JobList,
+    PageError,
+    PageProgress,
+    PageResult,
+)
 from ._webhook import WebhookEvent, verify_webhook
 from ._version import __version__
 
 __all__ = [
     "Image2PPTClient",
+    "ProgressCallback",
     "Job",
     "PageResult",
+    "PageProgress",
     "PageError",
     "CancellationResult",
     "CallbackStatus",
@@ -103,6 +114,7 @@ __all__ = [
     "InvalidIdempotencyKeyError",
     "InvalidCallbackUrlError",
     "InvalidPagesError",
+    "InvalidNameError",
     "PagesOutOfRangeError",
     "InvalidParameterError",
     "InvalidUrlError",

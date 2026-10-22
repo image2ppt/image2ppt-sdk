@@ -277,13 +277,21 @@ class IdempotencyKeyMismatchError(Image2PPTError):
 
     "The same request" means the same file bytes in the same order (or the same
     ``urls``), plus the same ``locale``, ``aspect_ratio``, ``pages`` and
-    ``callback_url``. Use a new key for a new submission.
+    ``callback_url`` and ``name``. Use a new key for a new submission.
     """
 
 
 class InvalidIdempotencyKeyError(Image2PPTError):
     """The ``Idempotency-Key`` is not 1–255 printable ASCII characters
     (400 ``INVALID_IDEMPOTENCY_KEY``). Checked locally before anything is sent."""
+
+
+class InvalidNameError(Image2PPTError):
+    """The task name is invalid (400 ``INVALID_NAME``).
+
+    Use a non-empty name without ``.pptx``, at most 60 Unicode characters and
+    180 UTF-8 bytes, with no forbidden filename characters or reserved name.
+    """
 
 
 class InvalidCallbackUrlError(Image2PPTError):
@@ -432,6 +440,7 @@ _CODE_TO_EXC: Dict[str, type] = {
     "IDEMPOTENCY_KEY_MISMATCH": IdempotencyKeyMismatchError,
     "INVALID_IDEMPOTENCY_KEY": InvalidIdempotencyKeyError,
     "INVALID_CALLBACK_URL": InvalidCallbackUrlError,
+    "INVALID_NAME": InvalidNameError,
     "INVALID_PAGES": InvalidPagesError,
     "PAGES_OUT_OF_RANGE": PagesOutOfRangeError,
     "INVALID_PARAMETER": InvalidParameterError,
