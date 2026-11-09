@@ -3,6 +3,21 @@
 All notable changes to the image2ppt SDKs (Python + TypeScript) are documented
 here. The two clients share a single version number.
 
+## 0.8.0
+
+### Changed
+
+- `aspectRatio` / `aspect_ratio` now documents every value the API accepts:
+  `auto`; landscape `16:9`, `4:3`, `16:10`, `21:9`, `3:2`, `5:4`, `1:1`,
+  `A4-landscape`, `Letter-landscape`; portrait `9:16`, `3:4`, `10:16`, `9:21`,
+  `2:3`, `4:5`, `A4-portrait`, `Letter-portrait`. The TypeScript `AspectRatio`
+  type takes all of them, so `"21:9"` or `"3:2"` no longer needs a cast. `auto` still
+  follows the first image's exact ratio.
+- TypeScript: because `AspectRatio` is wider, code that lists it exhaustively
+  (a `Record<AspectRatio, …>` with only the old keys, or a `switch` with no
+  `default`) needs the new values added before it compiles again.
+- Requires the service release that accepts these values (live since 2026-11-09).
+
 ## 0.7.0
 
 ### Added

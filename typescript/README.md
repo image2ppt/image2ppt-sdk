@@ -76,8 +76,9 @@ While a job is running, each snapshot carries:
 - `queueAhead` — jobs ahead of this one while it waits to start.
 
 `pageProgress`, `estimatedRemainingSeconds` and `queueAhead` are `null` once
-the job has ended. A returned promise is
-awaited before the next poll, and anything the callback throws ends the wait.
+the job has ended. A returned promise is awaited before the next poll, and anything
+the callback throws ends the wait. A runnable version is in
+[`examples/progress.ts`](https://github.com/image2ppt/image2ppt-sdk/blob/main/typescript/examples/progress.ts).
 
 Cancel a job you no longer need:
 
@@ -441,7 +442,7 @@ Every `Image2PPTError` also carries **`isTransient`** — whether **repeating th
 | `UploadAbortedError` | 400 | `UPLOAD_ABORTED` — the body never finished arriving and the server took nothing, so **resending the same files is safe** |
 | `MalformedUploadError` | 400 | `MALFORMED_UPLOAD` — the body was not valid `multipart/form-data`; **resending identical bytes will not help** |
 | `NoFilesError` | 400 | `NO_FILES` — no files reached the server |
-| `InvalidAspectRatioError` | 400 | `INVALID_ASPECT_RATIO` — use `auto`, `16:9`, or `4:3` |
+| `InvalidAspectRatioError` | 400 | `INVALID_ASPECT_RATIO` — the message lists every accepted value; see [Aspect ratio](https://image2ppt.com/en/docs/api#aspect-ratio) |
 | `TooManySlidesError` | 400 | `TOO_MANY_SLIDES` — also for more than 50 pages selected |
 | `InvalidPagesError` | 400 | `INVALID_PAGES` — `pages` is misspelled (also checked locally) |
 | `PagesOutOfRangeError` | 400 | `PAGES_OUT_OF_RANGE` — page 0, or past the end; subclasses `InvalidPagesError` |

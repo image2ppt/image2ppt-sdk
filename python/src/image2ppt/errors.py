@@ -188,8 +188,9 @@ class NoFilesError(Image2PPTError):
 class InvalidAspectRatioError(Image2PPTError):
     """``aspect_ratio`` was not one of the accepted values (400 ``INVALID_ASPECT_RATIO``).
 
-    Accepted: ``auto`` (default), ``16:9``, ``4:3``. Nothing was created and nothing
-    was charged — fix the value and submit again.
+    The error message lists every accepted value; the full table is at
+    https://image2ppt.com/en/docs/api#aspect-ratio.
+    Nothing was created and nothing was charged — fix the value and submit again.
     """
 
 

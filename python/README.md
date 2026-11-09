@@ -29,7 +29,7 @@ job = client.convert(
     ["slide1.png", "slide2.png", "report.pdf"],
     dest_path="out.pptx",
     locale="zh-CN",       # optional: "zh-CN" (default) or "en"
-    aspect_ratio="16:9",  # optional: "auto" (default) / "16:9" / "4:3"
+    aspect_ratio="16:9",  # optional: "auto" (default, first image's exact ratio), "4:3", "9:16", ...
 )
 print("done — credits used:", job.credits_used, "refunded:", job.credits_refunded)
 ```
@@ -73,8 +73,8 @@ While a job is running, each snapshot carries:
 - `queue_ahead` — jobs ahead of this one while it waits to start.
 
 `page_progress`, `estimated_remaining_seconds` and `queue_ahead` are `None` once
-the job has ended. Anything `on_progress`
-raises ends the wait and propagates.
+the job has ended. Anything `on_progress` raises ends the wait and propagates.
+A runnable version is in [`examples/progress.py`](https://github.com/image2ppt/image2ppt-sdk/blob/main/python/examples/progress.py).
 
 Cancel a job you no longer need:
 
@@ -432,7 +432,7 @@ Every exception this client raises about a *request* subclasses `Image2PPTError`
 | `UploadAbortedError` | 400 | `UPLOAD_ABORTED` — the body never finished arriving and the server took nothing, so **resending the same files is safe** |
 | `MalformedUploadError` | 400 | `MALFORMED_UPLOAD` — the body was not valid `multipart/form-data`; **resending identical bytes will not help** |
 | `NoFilesError` | 400 | `NO_FILES` — no files reached the server |
-| `InvalidAspectRatioError` | 400 | `INVALID_ASPECT_RATIO` — use `auto`, `16:9`, or `4:3` |
+| `InvalidAspectRatioError` | 400 | `INVALID_ASPECT_RATIO` — the message lists every accepted value; see [Aspect ratio](https://image2ppt.com/en/docs/api#aspect-ratio) |
 | `TooManySlidesError` | 400 | `TOO_MANY_SLIDES` — also for more than 50 pages selected |
 | `InvalidPagesError` | 400 | `INVALID_PAGES` — `pages` is misspelled (also checked locally) |
 | `PagesOutOfRangeError` | 400 | `PAGES_OUT_OF_RANGE` — page 0, or past the end; subclasses `InvalidPagesError` |

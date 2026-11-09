@@ -467,7 +467,10 @@ class Image2PPTClient:
                 <= 50 pages. For more files than one request can hold, use
                 ``submit_all`` / ``convert_all``.
             locale: ``zh-CN`` (default) or ``en``.
-            aspect_ratio: ``auto`` (default) / ``16:9`` / ``4:3``.
+            aspect_ratio: ``auto`` (default) uses the first image's exact ratio,
+                e.g. a 21:9 image gives a 21:9 slide. Common fixed canvases:
+                ``16:9`` / ``4:3`` / ``9:16`` / ``A4-landscape`` / ``A4-portrait``.
+                ``21:9``, ``3:2``, ``1:1`` and the rest: https://image2ppt.com/en/docs/api#aspect-ratio
             name: Task name and download filename, without ``.pptx``. The
                 resolved name is returned on ``Job.name``. Validated by the service.
             pages: Convert only these pages, e.g. ``"1-3, 7"``. Page numbers run
@@ -613,7 +616,10 @@ class Image2PPTClient:
         Args:
             paths: Local file paths.
             locale: ``zh-CN`` (default) or ``en``.
-            aspect_ratio: ``auto`` (default) / ``16:9`` / ``4:3``.
+            aspect_ratio: ``auto`` (default) uses the first image's exact ratio,
+                e.g. a 21:9 image gives a 21:9 slide. Common fixed canvases:
+                ``16:9`` / ``4:3`` / ``9:16`` / ``A4-landscape`` / ``A4-portrait``.
+                ``21:9``, ``3:2``, ``1:1`` and the rest: https://image2ppt.com/en/docs/api#aspect-ratio
             name: As ``submit``; reused for every batch, with collisions resolved
                 by the service.
             callback_url: As ``submit``; every batch's job calls it when it ends.
@@ -881,7 +887,10 @@ class Image2PPTClient:
                 before anything is submitted**, so an unusable destination costs
                 nothing.
             locale: ``zh-CN`` (default) or ``en``.
-            aspect_ratio: ``auto`` (default) / ``16:9`` / ``4:3``.
+            aspect_ratio: ``auto`` (default) uses the first image's exact ratio,
+                e.g. a 21:9 image gives a 21:9 slide. Common fixed canvases:
+                ``16:9`` / ``4:3`` / ``9:16`` / ``A4-landscape`` / ``A4-portrait``.
+                ``21:9``, ``3:2``, ``1:1`` and the rest: https://image2ppt.com/en/docs/api#aspect-ratio
             name: As ``submit_all``; output still uses ``part-NN.pptx``.
             callback_url: As ``submit_all``.
             poll_interval: Initial poll interval in seconds.

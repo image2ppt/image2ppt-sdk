@@ -3,7 +3,25 @@
 import { MalformedResponseError } from "./errors.js";
 
 export type Locale = "zh-CN" | "en";
-export type AspectRatio = "auto" | "16:9" | "4:3";
+export type AspectRatio =
+  | "auto"
+  | "16:9"
+  | "4:3"
+  | "16:10"
+  | "21:9"
+  | "3:2"
+  | "5:4"
+  | "1:1"
+  | "A4-landscape"
+  | "Letter-landscape"
+  | "9:16"
+  | "3:4"
+  | "10:16"
+  | "9:21"
+  | "2:3"
+  | "4:5"
+  | "A4-portrait"
+  | "Letter-portrait";
 export type JobStatus = "pending" | "processing" | "completed" | "failed";
 
 /**
@@ -231,7 +249,11 @@ export interface SubmitAllOptions {
    * what language error messages come back in.
    */
   locale?: Locale;
-  /** `auto` (default) / `16:9` / `4:3`. */
+  /**
+   * `auto` (default) uses the first image's exact ratio, e.g. a 21:9 image gives a
+   * 21:9 slide. Common fixed canvases: `16:9`, `4:3`, `9:16`, `A4-landscape`,
+   * `A4-portrait`; the rest are in the type and at https://image2ppt.com/en/docs/api#aspect-ratio.
+   */
   aspectRatio?: AspectRatio;
   /**
    * An `https` URL the service POSTs to when the job ends. Check each delivery with
